@@ -2422,15 +2422,10 @@ async function usage(auth) {
     if (e instanceof SignedOut) return { error: e.message, signIn: "expired" }
     return { error: e?.message ?? String(e), signIn: "kept" }
   }
-  const raw = catalogOf(l.infos)
-  const fams = families(raw)
-  const familyOf = (id) => fams.find((f) => f.variants.length > 1 && f.variants.some((v) => v.id === id))?.id ?? id
   const ws = []
   for (const mi of l.infos) {
     if (mi.remaining < 0) continue
     const w = { name: mi.name || mi.id, used: (1 - mi.remaining) * 100, model: mi.id, family: vendorOf(mi.id, mi.name) }
-    const fam = familyOf(mi.id)
-    w.models = fam !== mi.id ? [mi.id, fam] : [mi.id]
     if (mi.resets) {
       w.resetsAt = mi.resets
       w.resetSecs = resetSecs(mi.resets)
