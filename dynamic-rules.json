@@ -1,12 +1,12 @@
 {
   "version": 1,
-  "updatedAt": "2026-11-15T18:12:34.299245+00:00",
+  "updatedAt": "2026-11-15T19:11:44.675465+00:00",
   "systemTag": "external_system_instructions",
   "upstream": {
     "agyCli": {
       "source": "github:magpie-community/plugins/main/packages/agy-cli",
       "name": "@magpie-community/opencode-agy-cli-auth",
-      "version": "0.1.68"
+      "version": "0.1.69"
     },
     "bridge": {
       "source": "github:DylanLIiii/opencode-antigravity-bridge/main",
