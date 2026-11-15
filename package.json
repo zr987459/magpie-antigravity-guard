@@ -1,0 +1,31 @@
+{
+  "name": "@magpie-community/opencode-antigravity-auth",
+  "version": "0.1.20",
+  "description": "Hardened Antigravity plugin for Magpie with external_system_instructions isolation, Codex/Claude/PR#3967 anti-429 guard, 3-tier circuit breaker, and self-contained cloud rule hot-sync",
+  "type": "module",
+  "main": "./opencode.mjs",
+  "exports": {
+    ".": "./opencode2.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "opencode.mjs",
+    "opencode2.mjs",
+    "dynamic-rules.json",
+    "README.md"
+  ],
+  "keywords": [
+    "magpie",
+    "magpie-plugin",
+    "opencode",
+    "opencode-plugin",
+    "antigravity",
+    "gemini",
+    "codex"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zr987459/magpie-antigravity-guard.git"
+  }
+}

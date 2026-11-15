@@ -1,0 +1,9 @@
+node_modules/
+cooldowns.json
+rule-alerts.jsonl
+sync-trigger.flag
+sync-status.json
+*.bak*
+*.tmp-*
+.DS_Store
+README.md.orig
