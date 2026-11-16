@@ -339,7 +339,7 @@ const isRisk429Text = (text) => /Terms of Service|disabled in this account|TOS_V
 function isSuspectRuleBlock(status, headers, text, elapsedMs = null) {
   if (status !== 429) return false
   if (parseRetryDelayMs(headers, text) != null) return false
-  if (/QuotaFailure/i.test(String(text ?? ""))) return false
+  if (/QuotaFailure|RATE_LIMIT_EXCEEDED/i.test(String(text ?? ""))) return false
   if (/resource has been exhausted/i.test(String(text ?? ""))) return true
   return typeof elapsedMs === "number" && elapsedMs < 2500
 }
@@ -473,10 +473,9 @@ function recordUpstreamFailure(s, model, status, headers, text, ctx = {}) {
     void syncRemoteRulesIfNeeded(true)
     return
   }
-  if (status === 429) {
+  if (status === 429 && suspectRuleBlock) {
     const gb = recordGlobalRiskEvent(s, 429, msg)
-    let globalTriggered = gb.triggered
-    if (suspectRuleBlock && !gb.triggered) {
+    if (!gb.triggered) {
       const now = Date.now()
       const existing = cooldowns.get(GLOBAL_BREAKER_KEY)
       if (!existing || existing.until < now + SUSPECT_BREAKER_COOLDOWN_MS) {
@@ -488,23 +487,20 @@ function recordUpstreamFailure(s, model, status, headers, text, ctx = {}) {
           persisted: false,
         })
       }
-      globalTriggered = true
     }
-    if (globalTriggered || suspectRuleBlock) {
-      writeRuleAlert({
-        accounts: gb.accounts,
-        status: 429,
-        suspectRuleBlock,
-        globalTriggered,
-        errorText: text,
-        elapsedMs: ctx.elapsedMs,
-        rawSystem: ctx.rawSystem,
-        shapedSystem: ctx.shapedSystem,
-        firstUser: ctx.firstUser,
-      })
-      writeSyncTrigger({ status: 429, suspectRuleBlock, globalTriggered, accounts: gb.accounts })
-      if (suspectRuleBlock) void syncRemoteRulesIfNeeded(true)
-    }
+    writeRuleAlert({
+      accounts: gb.accounts,
+      status: 429,
+      suspectRuleBlock: true,
+      globalTriggered: true,
+      errorText: text,
+      elapsedMs: ctx.elapsedMs,
+      rawSystem: ctx.rawSystem,
+      shapedSystem: ctx.shapedSystem,
+      firstUser: ctx.firstUser,
+    })
+    writeSyncTrigger({ status: 429, suspectRuleBlock: true, globalTriggered: true, accounts: gb.accounts })
+    void syncRemoteRulesIfNeeded(true)
   }
   if ((status === 429 || status === 503) && model) {
     const key = modelCooldownKey(s, model)
@@ -1518,22 +1514,33 @@ async function syncRemoteRulesIfNeeded(force = false) {
 
 function allTurnsAway(system) {
   reloadDynamicRules()
+  if (typeof system !== "string" || !system) return false
   if (turnsAway(system)) return true
   return dynamicState.rules.some((r) => has(system, r.re))
 }
 
 function cloak(system, only) {
   reloadDynamicRules()
-  if (typeof system !== "string" || !allTurnsAway(system)) return system
+  if (typeof system !== "string" || !system) return system
   const at = []
+  const scan = (re, fn) => {
+    re.lastIndex = 0
+    let m
+    while ((m = re.exec(system)) !== null) {
+      at.push([m.index, m.index + m[0].length, fn])
+      if (m[0].length === 0) re.lastIndex++
+    }
+    re.lastIndex = 0
+  }
   TURNED_AWAY_RE.forEach((re, i) => {
     if (only && !only.includes(TURNED_AWAY[i])) return
-    for (const m of system.matchAll(re)) at.push([m.index, m.index + m[0].length, SAID_AS[TURNED_AWAY[i]]])
+    scan(re, SAID_AS[TURNED_AWAY[i]])
   })
   for (const r of dynamicState.rules) {
     if (only && !only.includes(r.phrase) && !dynamicState.userTurnedAway.has(r.phrase)) continue
-    for (const m of system.matchAll(r.re)) at.push([m.index, m.index + m[0].length, r.as])
+    scan(r.re, r.as)
   }
+  if (at.length === 0) return system
   at.sort((a, b) => a[0] - b[0] || b[1] - a[1])
   let out = ""
   let prev = 0
@@ -1641,20 +1648,22 @@ const DEFAULT_ANTIGRAVITY_SYSTEM =
 
 // shape is the Gemini request as Antigravity takes it for the model sent
 // at the level at, asked at effort
-function shape(req, sent, at, effort) {
+function shape(req, sent, at, effort, preSanitizedSystem) {
   req = structuredClone(req)
   const m = sent.toLowerCase()
   const claude = m.includes("claude")
   const sysParts = []
   if (isObj(req.systemInstruction)) {
-    for (const p of req.systemInstruction.parts ?? []) {
+    const parts = req.systemInstruction.parts ?? []
+    const usePre = typeof preSanitizedSystem === "string" && parts.length === 1 && typeof parts[0]?.text === "string"
+    for (const p of parts) {
       if (typeof p?.text === "string") {
-        const cleaned = outgoing(p.text).trim()
+        const cleaned = (usePre ? preSanitizedSystem : outgoing(p.text)).trim()
         if (cleaned) sysParts.push(cleaned)
       }
     }
   } else if (typeof req.systemInstruction === "string") {
-    const cleaned = outgoing(req.systemInstruction).trim()
+    const cleaned = (typeof preSanitizedSystem === "string" ? preSanitizedSystem : outgoing(req.systemInstruction)).trim()
     if (cleaned) sysParts.push(cleaned)
   }
   // Isolate external system prompt out of systemInstruction into the first user turn
@@ -1679,7 +1688,7 @@ function shape(req, sent, at, effort) {
         if (nonText.length) cleanedContents.push({ ...c, role: "user", parts: nonText })
         continue
       }
-      for (const p of c?.parts ?? []) if (typeof p?.text === "string" && !p.thought) p.text = outgoing(cloak(p.text, USER_TURNED_AWAY))
+      for (const p of c?.parts ?? []) if (typeof p?.text === "string" && !p.thought) p.text = outgoing(p.text)
       if (Array.isArray(c?.parts) && c.parts.length > 1) c.parts = c.parts.filter((p) => !(isObj(p) && p.text === "" && Object.keys(p).length === 1))
       for (const p of c?.parts ?? []) {
         if (isObj(p?.functionCall) && p.functionCall.id) p.functionCall.id = toolID(p.functionCall.id)
@@ -2084,7 +2093,12 @@ async function complete(s, url, init, magpie) {
   }
   const system = systemText(raw)
   const shapedSystem = outgoing(system)
-  const req = shape(raw, sent, at, effort)
+  const singleSysPart =
+    typeof raw.systemInstruction === "string" ||
+    (Array.isArray(raw.systemInstruction?.parts) &&
+      raw.systemInstruction.parts.length === 1 &&
+      typeof raw.systemInstruction.parts[0]?.text === "string")
+  const req = shape(raw, sent, at, effort, singleSysPart ? shapedSystem : undefined)
   let tok
   try {
     tok = await token(s)
@@ -2271,7 +2285,7 @@ async function whole(res) {
       // a stream ends on an empty text, which Claude refuses sent back
       if (p?.text === "" && !p.thoughtSignature && Object.keys(p).length === 1) continue
       const prev = parts[parts.length - 1]
-      if (typeof p.text === "string" && prev && typeof prev.text === "string" && !!prev.thought === !!p.thought && !p.thoughtSignature) prev.text += p.text
+      if (typeof p.text === "string" && prev && typeof prev.text === "string" && !!prev.thought === !!p.thought && !p.thoughtSignature && !prev.thoughtSignature) prev.text += p.text
       else parts.push({ ...p })
     }
     if (j.usageMetadata) out.usageMetadata = j.usageMetadata
@@ -2722,7 +2736,7 @@ async function webSearch({ query, count } = {}, ctx = {}) {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: "Bearer " + tok, "User-Agent": ua },
     body: JSON.stringify(envelope(req, sent, l.project.id, false, undefined, accountSalt(s))),
-    signal: ctx.abort,
+    signal: ctx.abort ?? AbortSignal.timeout(60_000),
   })
   if (!res.ok) {
     const text = await res.text()
@@ -2893,4 +2907,5 @@ export const _internal = {
   DEFAULT_REMOTE_RULES_URL,
   REMOTE_SYNC_INTERVAL_MS,
   recordUpstreamFailure,
+  isSuspectRuleBlock,
 }

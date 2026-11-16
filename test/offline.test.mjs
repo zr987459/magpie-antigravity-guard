@@ -131,6 +131,112 @@ assert.equal(merged.systemTag, "my_custom_tag")
 assert.equal(merged.customRules["local secret phrase"], "local clean")
 assert.equal(merged.saidAs["remote phrase"], "remote clean")
 
+// 7. Global 10-min breaker must NOT trip on normal quota 429s, but MUST trip on >=2 accounts hitting 403 or suspect rule-block 429
+const resetBreakerState = () => {
+  _internal.cooldowns.clear()
+  _internal.recentRiskEvents.length = 0
+  for (const p of [_internal.COOLDOWNS_PATH, _internal.RULE_ALERTS_PATH, _internal.SYNC_TRIGGER_PATH]) {
+    try {
+      if (fs.existsSync(p)) fs.unlinkSync(p)
+    } catch {}
+  }
+}
+
+try {
+  resetBreakerState()
+  const acctA = { rt: "rt-quota-a", who: "quotaA@example.com" }
+  const acctB = { rt: "rt-quota-b", who: "quotaB@example.com" }
+  const quotaHeaders = new Headers({ "retry-after": "45" })
+  const quotaBody = JSON.stringify({
+    error: {
+      code: 429,
+      message: "Resource has been exhausted (e.g. check quota).",
+      details: [{ "@type": "type.googleapis.com/google.rpc.QuotaFailure" }, { retryDelay: "45s" }],
+    },
+  })
+  const rateLimitBody = JSON.stringify({
+    error: {
+      code: 429,
+      message: "Resource has been exhausted.",
+      details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "RATE_LIMIT_EXCEEDED" }],
+    },
+  })
+
+  _internal.recordUpstreamFailure(acctA, "gemini-4-argon", 429, quotaHeaders, quotaBody, { elapsedMs: 300 })
+  _internal.recordUpstreamFailure(acctB, "gemini-4-argon", 429, new Headers(), rateLimitBody, { elapsedMs: 300 })
+  assert.equal(_internal.cooldowns.has(_internal.GLOBAL_BREAKER_KEY), false, "normal quota 429s across 2 accounts must NOT trip global:breaker")
+  assert.equal(_internal.recentRiskEvents.length, 0, "normal quota 429s must NOT record global risk events")
+  assert.ok(_internal.cooldowns.has(`model:${acctA.rt}\0gemini-4-argon`), "acctA should have per-model cooldown")
+  assert.ok(_internal.cooldowns.has(`model:${acctB.rt}\0gemini-4-argon`), "acctB should have per-model cooldown")
+
+  // Bare suspect 429 on 1st account triggers 60s pause, 2nd account triggers 10-min persisted global:breaker
+  resetBreakerState()
+  const suspectBody = JSON.stringify({ error: { code: 429, message: "Resource has been exhausted (e.g. check quota)." } })
+  assert.equal(_internal.isSuspectRuleBlock(429, new Headers(), suspectBody, 400), true)
+  assert.equal(_internal.isSuspectRuleBlock(429, quotaHeaders, quotaBody, 400), false)
+  assert.equal(_internal.isSuspectRuleBlock(429, new Headers(), rateLimitBody, 400), false)
+
+  _internal.recordUpstreamFailure(acctA, "gemini-4-argon", 429, new Headers(), suspectBody, { elapsedMs: 400 })
+  const pauseEntry = _internal.cooldowns.get(_internal.GLOBAL_BREAKER_KEY)
+  assert.ok(pauseEntry && pauseEntry.persisted === false, "1st suspect 429 should trigger short non-persisted 60s pause")
+
+  _internal.recordUpstreamFailure(acctB, "gemini-4-argon", 429, new Headers(), suspectBody, { elapsedMs: 400 })
+  const suspectBreaker = _internal.cooldowns.get(_internal.GLOBAL_BREAKER_KEY)
+  assert.ok(suspectBreaker && suspectBreaker.persisted === true, "2nd suspect 429 within 60s should trip 10-min persisted global:breaker")
+
+  // 2 accounts hitting 403 within 60s trips 10-min persisted global:breaker
+  resetBreakerState()
+  _internal.recordUpstreamFailure(acctA, "gemini-4-argon", 403, new Headers(), "Forbidden")
+  assert.equal(_internal.cooldowns.has(_internal.GLOBAL_BREAKER_KEY), false, "single 403 should not trip global:breaker")
+  _internal.recordUpstreamFailure(acctB, "gemini-4-argon", 403, new Headers(), "Forbidden")
+  const breaker403 = _internal.cooldowns.get(_internal.GLOBAL_BREAKER_KEY)
+  assert.ok(breaker403 && breaker403.persisted === true && breaker403.status === 403, "two 403s within 60s should trip 10-min global:breaker")
+} finally {
+  resetBreakerState()
+}
+
+// 8. whole() must NOT merge plain text into a preceding thoughtSignature part
+const sseBody = [
+  'data: {"response":{"candidates":[{"content":{"parts":[{"text":"Thinking...","thought":true},{"text":"","thoughtSignature":"sig-1"}]}}]}}',
+  'data: {"response":{"candidates":[{"content":{"parts":[{"text":"Hello "},{"text":"world","thoughtSignature":"sig-2"},{"text":" trailing"}]}}]}}',
+  'data: {"response":{"candidates":[{"content":{"parts":[{"text":"!"}],"finishReason":"STOP"}}]}}',
+].join("\n")
+const wholeOut = await _internal.whole(new Response(sseBody, { status: 200 }))
+const wholeParts = wholeOut.candidates[0].content.parts
+assert.equal(wholeParts.length, 5, JSON.stringify(wholeParts))
+assert.deepEqual(wholeParts[0], { text: "Thinking...", thought: true })
+assert.deepEqual(wholeParts[1], { text: "", thoughtSignature: "sig-1" })
+assert.deepEqual(wholeParts[2], { text: "Hello " })
+assert.deepEqual(wholeParts[3], { text: "world", thoughtSignature: "sig-2" })
+assert.deepEqual(wholeParts[4], { text: " trailing!" })
+
+// 9. Sanitization output on INVISIBLE / zero-width chars and single-part vs preSanitized system instructions remains identical
+const invisInput = "You\u00ad are\u180e Claude\u200b Code,\u2060 Anthropic's\ufeff official CLI for Claude.\nRun tools.opencode.session_move now."
+const expectedSanitized = "You are an AI coding assistant.\nRun tools.session_transfer now."
+assert.equal(_internal.outgoing(invisInput), expectedSanitized)
+assert.equal(_internal.cloak("no matches here"), "no matches here")
+
+const shapedDefault = _internal.shape(
+  {
+    systemInstruction: { parts: [{ text: invisInput }] },
+    contents: [{ role: "user", parts: [{ text: "Hi\u200b You\u200c are Codex, an agent based on GPT-6." }] }],
+  },
+  "gemini-4-argon",
+  "high",
+  "high",
+)
+const shapedPre = _internal.shape(
+  {
+    systemInstruction: { parts: [{ text: invisInput }] },
+    contents: [{ role: "user", parts: [{ text: "Hi\u200b You\u200c are Codex, an agent based on GPT-6." }] }],
+  },
+  "gemini-4-argon",
+  "high",
+  "high",
+  expectedSanitized,
+)
+assert.deepEqual(shapedPre, shapedDefault)
+
 console.log(
   `OFFLINE_SUITE_OK platform=${os.platform()} dir=${_internal.PLUGIN_DIR} dynamicRules=${_internal.dynamicState.rules.length}`,
 )
