@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-11-19T05:23:38.584565+00:00",
+  "updatedAt": "2026-11-19T05:44:53.915023+00:00",
   "systemTag": "external_system_instructions",
   "clientMeta": {
     "cls": {
@@ -14,9 +14,7 @@
       "name": "@magpie-community/opencode-antigravity-auth",
       "version": "0.2.4",
       "index_mjsSha256": "97ff7ec6988bc49b044e9ceefdc82b229308bcb047a63a6c7235cb43c03e60b0",
-      "changed": true,
-      "previousVersion": "0.2.3",
-      "previousSha256": "0e8adb2eda454e534ee873862f612e4b1fbbe554c1a0a0b59e3e23431c4d20d4"
+      "changed": false
     },
     "agyCli": {
       "source": "github:magpie-community/plugins/main/packages/agy-cli",
