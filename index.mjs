@@ -25,8 +25,10 @@
 import crypto from "node:crypto"
 import fs from "node:fs"
 import http from "node:http"
+import https from "node:https"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import zlib from "node:zlib"
 
 const PROVIDER = "antigravity"
 
@@ -57,8 +59,8 @@ const BASE = DAILY + "/v1beta"
 const NPM = "@ai-sdk/google"
 
 const VERSION_URL = "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml"
-// the manifest's version on 2026-11-14; Google serves Gemini 4 only to
-// releases about this new (2.9.1 got no Gemini 4, #1057)
+// the newest version with an exact known CL in CLS; Google serves Gemini 4
+// to releases >= 2.20, and we never emit a version without its matching CL
 const DEFAULT_VERSION = "2.32.1"
 // CLS is the build changelist each release's language server puts in its
 // User-Agent (cl=), read from the shipped binary's requests. The manifest
@@ -96,10 +98,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 // apiError is what a failed reply says: its JSON error's message, or its
 // body, or the status (magpie's APIError)
 function apiError(body, status) {
+  const strip = (v) => String(v ?? "").trim().replace(/^(?:Antigravity:\s*)+/i, "")
   const j = parse(body)
   const m = isObj(j) ? (isObj(j.error) ? j.error.message : typeof j.error === "string" ? j.error : j.message) : undefined
-  if (typeof m === "string" && m.trim()) return m.trim()
-  const t = String(body ?? "").trim()
+  if (typeof m === "string" && m.trim()) return strip(m)
+  const t = strip(body)
   return t ? t.slice(0, 1000) : String(status)
 }
 
@@ -111,6 +114,364 @@ class StatusError extends Error {
 }
 
 class SignedOut extends Error {}
+
+// ---- per-account isolated HTTP/HTTPS connection pool ----------------------------------
+
+const POOL_MAX_ACCOUNTS = 32
+const POOL_AGENT_OPTIONS = {
+  keepAlive: true,
+  maxSockets: 20,
+  maxFreeSockets: 8,
+  keepAliveMsecs: 30_000,
+  timeout: 60_000,
+}
+
+class AccountPoolManager {
+  constructor(maxPools = POOL_MAX_ACCOUNTS, agentOptions = POOL_AGENT_OPTIONS) {
+    this.maxPools = maxPools
+    this.agentOptions = agentOptions
+    this.pools = new Map()
+  }
+
+  normalizeKey(accountKey) {
+    const raw = String(accountKey ?? "").trim()
+    if (!raw) return "default"
+    return crypto.createHash("sha256").update(raw).digest("hex").slice(0, 16)
+  }
+
+  getEntry(accountKey) {
+    const key = this.normalizeKey(accountKey)
+    let entry = this.pools.get(key)
+    if (entry) {
+      this.pools.delete(key)
+      entry.lastUsedAt = Date.now()
+      this.pools.set(key, entry)
+      return entry
+    }
+    while (this.pools.size >= this.maxPools) {
+      const oldestKey = this.pools.keys().next().value
+      if (oldestKey === undefined) break
+      const oldest = this.pools.get(oldestKey)
+      this.pools.delete(oldestKey)
+      try { oldest?.httpsAgent?.destroy() } catch {}
+      try { oldest?.httpAgent?.destroy() } catch {}
+    }
+    entry = {
+      key,
+      httpsAgent: null,
+      httpAgent: null,
+      lastUsedAt: Date.now(),
+    }
+    this.pools.set(key, entry)
+    return entry
+  }
+
+  getAgent(accountKey, protocol) {
+    const entry = this.getEntry(accountKey)
+    if (protocol === "http:") {
+      if (!entry.httpAgent) entry.httpAgent = new http.Agent(this.agentOptions)
+      return entry.httpAgent
+    }
+    if (!entry.httpsAgent) entry.httpsAgent = new https.Agent(this.agentOptions)
+    return entry.httpsAgent
+  }
+
+  destroyAccount(accountKey) {
+    const key = this.normalizeKey(accountKey)
+    const entry = this.pools.get(key)
+    if (!entry) return
+    this.pools.delete(key)
+    try { entry.httpsAgent?.destroy() } catch {}
+    try { entry.httpAgent?.destroy() } catch {}
+  }
+
+  destroyAll() {
+    for (const entry of this.pools.values()) {
+      try { entry.httpsAgent?.destroy() } catch {}
+      try { entry.httpAgent?.destroy() } catch {}
+    }
+    this.pools.clear()
+  }
+}
+
+const accountPoolManager = new AccountPoolManager()
+
+function toAbortError(reason) {
+  if (reason instanceof Error) return reason
+  return Object.assign(new Error(reason ? String(reason) : "The operation was aborted"), { name: "AbortError" })
+}
+
+function isStaleSocketResetError(err) {
+  if (!err) return false
+  const code = String(err.code ?? "")
+  if (code === "ECONNRESET" || code === "EPIPE" || code === "ECONNABORTED") return true
+  return /socket hang up/i.test(String(err.message ?? ""))
+}
+
+function normalizePoolHeaders(headers) {
+  const out = {}
+  const seen = new Set()
+  const set = (k, v) => {
+    if (v === undefined || v === null) return
+    const keyStr = String(k)
+    const low = keyStr.toLowerCase()
+    if (seen.has(low)) {
+      for (const existing of Object.keys(out)) {
+        if (existing.toLowerCase() === low) delete out[existing]
+      }
+    }
+    seen.add(low)
+    out[keyStr] = String(v)
+  }
+  if (!headers) return { headers: out, has: (name) => seen.has(name.toLowerCase()) }
+  if (headers instanceof Headers) {
+    for (const [k, v] of headers.entries()) set(k, v)
+  } else if (Array.isArray(headers)) {
+    for (const pair of headers) {
+      if (Array.isArray(pair) && pair.length >= 2) set(pair[0], pair[1])
+    }
+  } else if (typeof headers === "object") {
+    for (const [k, v] of Object.entries(headers)) set(k, v)
+  }
+  return { headers: out, has: (name) => seen.has(name.toLowerCase()) }
+}
+
+async function bodyToBuffer(body) {
+  if (body == null) return null
+  if (typeof body === "string") return Buffer.from(body, "utf8")
+  if (Buffer.isBuffer(body)) return body
+  if (ArrayBuffer.isView(body)) return Buffer.from(body.buffer, body.byteOffset, body.byteLength)
+  if (body instanceof ArrayBuffer) return Buffer.from(body)
+  if (body instanceof URLSearchParams) return Buffer.from(body.toString(), "utf8")
+  return Buffer.from(await new Response(body).arrayBuffer())
+}
+
+function accountFetchOnce(accountKey, urlObj, method, reqHeaders, bodyBuf, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(toAbortError(signal.reason))
+
+    const protocol = urlObj.protocol === "http:" ? "http:" : "https:"
+    const transport = protocol === "http:" ? http : https
+    const agent = accountPoolManager.getAgent(accountKey, protocol)
+
+    let settled = false
+    let headersReceived = false
+    let done = false
+    let cleaned = false
+    let reqRef = null
+    let resRef = null
+    let decodedRef = null
+    let ctlRef = null
+
+    const cleanupSignal = () => {
+      if (signal) signal.removeEventListener("abort", onAbort)
+    }
+
+    const cleanupTransport = (err, destroyTransport = true) => {
+      if (cleaned) return
+      cleaned = true
+      done = true
+      cleanupSignal()
+      if (destroyTransport) {
+        if (decodedRef && decodedRef !== resRef) {
+          try { decodedRef.destroy(err) } catch {}
+        }
+        if (resRef) {
+          try { resRef.destroy(err) } catch {}
+        }
+        if (reqRef) {
+          try { reqRef.destroy(err) } catch {}
+        }
+      }
+    }
+
+    const safeOnError = (err) => {
+      if (done) return
+      const finalErr = signal?.aborted ? toAbortError(signal.reason) : err
+      cleanupTransport(finalErr, true)
+      if (ctlRef) {
+        try { ctlRef.error(finalErr) } catch {}
+      }
+    }
+
+    const onAbort = () => {
+      const err = toAbortError(signal?.reason)
+      cleanupTransport(err, true)
+      if (!settled) {
+        settled = true
+        reject(err)
+      } else if (ctlRef) {
+        try { ctlRef.error(err) } catch {}
+      }
+    }
+
+    if (signal) signal.addEventListener("abort", onAbort, { once: true })
+
+    const req = transport.request(
+      {
+        protocol,
+        hostname: urlObj.hostname,
+        port: urlObj.port || (protocol === "http:" ? 80 : 443),
+        path: urlObj.pathname + urlObj.search,
+        method,
+        headers: reqHeaders,
+        agent,
+      },
+      (res) => {
+        resRef = res
+        headersReceived = true
+        if (signal?.aborted) {
+          const err = toAbortError(signal.reason)
+          cleanupTransport(err, true)
+          if (!settled) {
+            settled = true
+            reject(err)
+          }
+          return
+        }
+
+        const status = res.statusCode || 200
+        const resHeaders = new Headers()
+        for (const [k, v] of Object.entries(res.headers)) {
+          if (v === undefined) continue
+          if (Array.isArray(v)) {
+            for (const item of v) resHeaders.append(k, String(item))
+          } else {
+            resHeaders.set(k, String(v))
+          }
+        }
+
+        if (method === "HEAD" || status === 204 || status === 205 || status === 304) {
+          cleanupTransport(undefined, false)
+          res.resume()
+          settled = true
+          resolve(new Response(null, { status, statusText: res.statusMessage || "", headers: resHeaders }))
+          return
+        }
+
+        const ce = String(res.headers["content-encoding"] ?? "").toLowerCase().trim()
+        let bodyStream = res
+        if (ce === "gzip" || ce === "x-gzip") {
+          bodyStream = res.pipe(zlib.createGunzip())
+          resHeaders.delete("content-encoding")
+          resHeaders.delete("content-length")
+        } else if (ce === "deflate") {
+          bodyStream = res.pipe(zlib.createInflate())
+          resHeaders.delete("content-encoding")
+          resHeaders.delete("content-length")
+        } else if (ce === "br") {
+          bodyStream = res.pipe(zlib.createBrotliDecompress())
+          resHeaders.delete("content-encoding")
+          resHeaders.delete("content-length")
+        }
+        decodedRef = bodyStream
+
+        const webStream = new ReadableStream({
+          start(ctl) {
+            ctlRef = ctl
+            const onEnd = () => {
+              if (done) return
+              cleanupTransport(undefined, false)
+              if (decodedRef && decodedRef !== resRef) {
+                try { decodedRef.destroy() } catch {}
+              }
+              try { ctl.close() } catch {}
+            }
+            const onData = (chunk) => {
+              if (done) return
+              try {
+                ctl.enqueue(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk))
+                if (ctl.desiredSize !== null && ctl.desiredSize <= 0) {
+                  bodyStream.pause()
+                }
+              } catch (e) {
+                safeOnError(e)
+              }
+            }
+            bodyStream.on("data", onData)
+            bodyStream.once("end", onEnd)
+            bodyStream.on("error", safeOnError)
+            if (bodyStream !== res) {
+              res.on("error", safeOnError)
+            }
+            res.once("aborted", () => {
+              if (!done) safeOnError(new Error("aborted"))
+            })
+            res.once("close", () => {
+              if (!done && !res.complete) {
+                safeOnError(new Error("Response stream closed prematurely"))
+              }
+            })
+          },
+          pull() {
+            if (!done) bodyStream.resume()
+          },
+          cancel(reason) {
+            const err = reason instanceof Error ? reason : undefined
+            cleanupTransport(err, true)
+          },
+        })
+
+        settled = true
+        resolve(new Response(webStream, { status, statusText: res.statusMessage || "", headers: resHeaders }))
+      },
+    )
+    reqRef = req
+
+    req.on("error", (err) => {
+      if (!headersReceived) {
+        const finalErr = signal?.aborted ? toAbortError(signal.reason) : err
+        cleanupTransport(finalErr, true)
+        if (!settled) {
+          settled = true
+          reject(finalErr)
+        }
+        return
+      }
+      safeOnError(err)
+    })
+
+    req.on("timeout", () => {
+      const err = Object.assign(new Error("antigravity upstream socket timeout"), { code: "ETIMEDOUT" })
+      if (!headersReceived) {
+        const finalErr = signal?.aborted ? toAbortError(signal.reason) : err
+        cleanupTransport(finalErr, true)
+        if (!settled) {
+          settled = true
+          reject(finalErr)
+        }
+        return
+      }
+      safeOnError(err)
+    })
+
+    if (bodyBuf !== null) req.write(bodyBuf)
+    req.end()
+  })
+}
+
+async function accountFetch(accountKey, input, init = {}) {
+  const urlStr = input instanceof Request ? input.url : String(input)
+  const urlObj = new URL(urlStr)
+  const method = String(init?.method ?? (input instanceof Request ? input.method : "GET") ?? "GET").toUpperCase()
+  const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined)
+  const rawHeaders = init?.headers ?? (input instanceof Request ? input.headers : undefined)
+  const { headers, has } = normalizePoolHeaders(rawHeaders)
+  const rawBody = init?.body !== undefined ? init.body : input instanceof Request && method !== "GET" && method !== "HEAD" ? input.body : undefined
+  const bodyBuf = await bodyToBuffer(rawBody)
+  if (!has("accept-encoding")) headers["Accept-Encoding"] = "gzip, deflate, br"
+  if (bodyBuf !== null && !has("content-length") && !has("transfer-encoding")) {
+    headers["Content-Length"] = String(bodyBuf.byteLength)
+  }
+  try {
+    return await accountFetchOnce(accountKey, urlObj, method, headers, bodyBuf, signal)
+  } catch (err) {
+    if (!signal?.aborted && isStaleSocketResetError(err)) {
+      return await accountFetchOnce(accountKey, urlObj, method, headers, bodyBuf, signal)
+    }
+    throw err
+  }
+}
 
 // ---- the app's version and user agent ------------------------------------------------
 
@@ -126,8 +487,37 @@ const ver = { v: "", at: 0, pending: null }
 // and serves some models (Gemini 4) only to new enough releases, so a
 // manifest that can't be read keeps the default for a minute only, and a
 // version that changes drops the model lists read under the old one.
+function cmpVersion(a, b) {
+  const x = a.split(".").map(Number)
+  const y = b.split(".").map(Number)
+  for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0)
+  return 0
+}
+
+function highestKnownVersion(cls = CLS) {
+  const keys = Object.keys(cls || {})
+  if (!keys.length) return DEFAULT_VERSION
+  return keys.sort((a, b) => cmpVersion(b, a))[0]
+}
+
+function effectiveCLS() {
+  return typeof dynamicState !== "undefined" && isObj(dynamicState?.cls) ? dynamicState.cls : CLS
+}
+
+// resolveVersion strictly returns only a version that has an exact matching CL
+// in effectiveCLS() (built-in CLS + hot-loaded clientMeta.cls). Never pairs a
+// newer manifest version with an older CL fingerprint.
+function resolveVersion(candidate, clsOverride) {
+  const cls = isObj(clsOverride) ? clsOverride : effectiveCLS()
+  const v = typeof candidate === "string" ? candidate.trim() : ""
+  if (v && cls[v]) return v
+  const cfgDefault = typeof dynamicState !== "undefined" ? String(dynamicState?.defaultVersion ?? "").trim() : ""
+  if (cfgDefault && cls[cfgDefault]) return cfgDefault
+  return highestKnownVersion(cls)
+}
+
 async function version() {
-  if (ver.v && Date.now() - ver.at < VERSION_TTL) return ver.v
+  if (ver.v && Date.now() - ver.at < VERSION_TTL) return resolveVersion(ver.v)
   if (ver.pending) return ver.pending
   ver.at = Date.now()
   if (!ver.v) ver.v = DEFAULT_VERSION
@@ -147,35 +537,28 @@ async function version() {
     } catch {}
     if (!read) ver.at = Date.now() - VERSION_TTL + VERSION_RETRY
     else if (read !== ver.v) {
+      const prevResolved = resolveVersion(ver.v)
       ver.v = read
-      lists.clear()
+      const nextResolved = resolveVersion(ver.v)
+      if (nextResolved !== prevResolved) lists.clear()
     }
     ver.pending = null
-    return ver.v
+    return resolveVersion(ver.v)
   })()
   return ver.pending
 }
 
-// clOf is the changelist of a release: its own when known, else the
-// newest known release's
+// clOf is the changelist of a release, strictly paired via resolveVersion
 function clOf(v) {
-  if (CLS[v]) return CLS[v]
-  const newest = Object.keys(CLS).sort((a, b) => cmpVersion(b, a))[0]
-  return CLS[newest]
+  const cls = effectiveCLS()
+  const rv = resolveVersion(v, cls)
+  return cls[rv] ?? CLS[DEFAULT_VERSION]
 }
 
-function cmpVersion(a, b) {
-  const x = a.split(".").map(Number)
-  const y = b.split(".").map(Number)
-  for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0)
-  return 0
-}
-
-// userAgent is the app's language server's, as 2.32.1 sends it on every
-// Code Assist call:
-// antigravity/hub/2.32.1 (aidev_client; os_type=darwin; arch=arm64; cl=1021296516)
+// userAgent is the app's language server's, strictly paired (version + exact CL)
 const userAgent = async () => {
-  const v = await version()
+  if (typeof reloadDynamicRules === "function") reloadDynamicRules()
+  const v = resolveVersion(await version())
   return `antigravity/hub/${v} (aidev_client; os_type=${goos()}; arch=${goarch()}; cl=${clOf(v)})`
 }
 
@@ -194,40 +577,130 @@ function stateOf(auth) {
 }
 
 const tokens = new Map() // refresh token → {access, expires}
+const tokenInFlight = new Map() // refresh token → Promise<string> (per-account singleflight)
 const projects = new Map() // refresh token → project
 const refused = new Map() // refresh token, project, tier → when Google refused the tier
 
-async function postForm(url, form) {
-  const res = await fetch(url, {
+const MAX_BOUNDED_CACHE = 256
+const MAX_COOLDOWN_CACHE = 512
+
+function pruneBoundedMap(map, maxSize = MAX_BOUNDED_CACHE, isExpired) {
+  const now = Date.now()
+  if (typeof isExpired === "function") {
+    for (const [k, v] of map.entries()) {
+      if (isExpired(v, now)) map.delete(k)
+    }
+  }
+  while (map.size > maxSize) {
+    const oldestKey = map.keys().next().value
+    if (oldestKey === undefined) break
+    map.delete(oldestKey)
+  }
+}
+
+const isTokenExpired = (v, now) => !v || v.expires <= now
+const isProjectExpired = (v, now) => !v || now - v.at >= 24 * 60 * 60 * 1000
+const isListExpired = (v, now) => !v || now - v.at >= MODELS_TTL
+const isRefusedExpired = (v, now) => !Number.isFinite(v) || now - v >= TIER_REFUSED_FOR
+const isCooldownExpired = (v, now) => !v || !Number.isFinite(v.until) || v.until <= now
+const isStreak503Expired = (v, now) => !v || now - v.firstAt > timeouts.window503Ms
+
+let lastMapPruneAt = 0
+const MAP_PRUNE_INTERVAL_MS = 5 * 60 * 1000
+
+function pruneGlobalMaps(force = false) {
+  const now = Date.now()
+  if (!force && now - lastMapPruneAt < MAP_PRUNE_INTERVAL_MS) return
+  lastMapPruneAt = now
+  pruneBoundedMap(cooldowns, MAX_COOLDOWN_CACHE, isCooldownExpired)
+  pruneBoundedMap(streak503, MAX_COOLDOWN_CACHE, isStreak503Expired)
+  pruneBoundedMap(refused, MAX_BOUNDED_CACHE, isRefusedExpired)
+  pruneBoundedMap(tokens, MAX_BOUNDED_CACHE, isTokenExpired)
+  pruneBoundedMap(projects, MAX_BOUNDED_CACHE, isProjectExpired)
+  pruneBoundedMap(lists, MAX_BOUNDED_CACHE, isListExpired)
+  pruneBoundedMap(enums, MAX_BOUNDED_CACHE)
+}
+
+async function postForm(url, form, poolKey = "") {
+  const reqInit = {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams(form).toString(),
     signal: AbortSignal.timeout(30_000),
-  })
+  }
+  const res = poolKey ? await accountFetch(poolKey, url, reqInit) : await fetch(url, reqInit)
   const text = await res.text()
-  if (!res.ok) throw new StatusError(res.status, apiError(text, res.status))
+  if (!res.ok) {
+    const err = new StatusError(res.status, apiError(text, res.status))
+    err.body = text
+    throw err
+  }
   return parse(text) ?? {}
 }
 
+function isOAuthRevokedText(text) {
+  const s = String(text ?? "")
+  if (/\b(?:invalid_grant|unauthorized_client|invalid_client)\b/i.test(s)) return true
+  if (/token has been expired or revoked/i.test(s)) return true
+  const j = parse(s)
+  const errCode = isObj(j) ? String(j.error ?? "") : ""
+  return /^(?:invalid_grant|unauthorized_client|invalid_client)$/i.test(errCode)
+}
+
+function recordOAuthDeadCooldown(s, message) {
+  if (!s?.rt) return
+  const key = acctCooldownKey(s)
+  const prev = cooldowns.get(key)
+  cooldowns.set(key, {
+    until: Date.now() + COOLDOWN_OAUTH_DEAD_MS,
+    status: 401,
+    message,
+    strikes: (prev?.strikes ?? 0) + 1,
+    persisted: true,
+    oauthDead: true,
+  })
+  tokens.delete(s.rt)
+  savePersistentCooldowns()
+}
+
 // token is an access token for s, minted again from its refresh token
-// when less than two minutes of the last are left
+// when less than two minutes of the last are left (per-account singleflight)
 async function token(s) {
+  const deadCd = activeCooldown(acctCooldownKey(s))
+  if (deadCd && (deadCd.status === 401 || deadCd.oauthDead)) {
+    throw new SignedOut(deadCd.message)
+  }
   let t = tokens.get(s.rt)
   if (!t && s.access) t = { access: s.access, expires: s.expires }
   if (t?.access && t.expires - Date.now() > 2 * 60 * 1000) return t.access
-  let fresh
-  try {
-    fresh = await postForm(TOKEN_URL, { grant_type: "refresh_token", refresh_token: s.rt, client_id: CLIENT_ID, client_secret: CLIENT_SECRET })
-  } catch (e) {
-    // Google refusing the refresh token (invalid_grant) is a sign-in that
-    // is over; anything else (the network) may pass
-    if (e instanceof StatusError && (e.status === 400 || e.status === 401)) throw new SignedOut(`Antigravity is signed out (${e.message}); sign in again from magpie`)
-    throw e
-  }
-  if (!fresh.access_token) throw new SignedOut("Antigravity is signed out (no token); sign in again from magpie")
-  t = { access: fresh.access_token, expires: Date.now() + (Number(fresh.expires_in) || 3600) * 1000 }
-  tokens.set(s.rt, t)
-  return t.access
+  const inflight = tokenInFlight.get(s.rt)
+  if (inflight) return inflight
+  const promise = (async () => {
+    let fresh
+    try {
+      fresh = await postForm(TOKEN_URL, { grant_type: "refresh_token", refresh_token: s.rt, client_id: CLIENT_ID, client_secret: CLIENT_SECRET }, accountSalt(s) || s.rt)
+    } catch (e) {
+      // Google refusing the refresh token (invalid_grant / unauthorized_client)
+      // is a sign-in that is over; anything else (the network) may pass
+      if (e instanceof StatusError && (e.status === 400 || e.status === 401)) {
+        const msg = `Antigravity is signed out (${e.message}); sign in again from magpie`
+        if (isOAuthRevokedText(e.body ?? e.message)) {
+          recordOAuthDeadCooldown(s, msg)
+        }
+        throw new SignedOut(msg)
+      }
+      throw e
+    }
+    if (!fresh.access_token) throw new SignedOut("Antigravity is signed out (no token); sign in again from magpie")
+    const next = { access: fresh.access_token, expires: Date.now() + (Number(fresh.expires_in) || 3600) * 1000 }
+    tokens.set(s.rt, next)
+    if (tokens.size > MAX_BOUNDED_CACHE) pruneBoundedMap(tokens, MAX_BOUNDED_CACHE, isTokenExpired)
+    return next.access
+  })().finally(() => {
+    if (tokenInFlight.get(s.rt) === promise) tokenInFlight.delete(s.rt)
+  })
+  tokenInFlight.set(s.rt, promise)
+  return promise
 }
 
 const PLUGIN_DIR = (() => {
@@ -237,7 +710,10 @@ const PLUGIN_DIR = (() => {
     return process.cwd()
   }
 })()
-const DYNAMIC_RULES_PATH = path.join(PLUGIN_DIR, "dynamic-rules.json")
+const DYNAMIC_RULES_PATH =
+  typeof process !== "undefined" && process.env?.MAGPIE_AG_DYNAMIC_RULES_PATH
+    ? path.resolve(process.env.MAGPIE_AG_DYNAMIC_RULES_PATH)
+    : path.join(PLUGIN_DIR, "dynamic-rules.json")
 const RULE_ALERTS_PATH = path.join(PLUGIN_DIR, "rule-alerts.jsonl")
 const SYNC_TRIGGER_PATH = path.join(PLUGIN_DIR, "sync-trigger.flag")
 const COOLDOWNS_PATH = path.join(PLUGIN_DIR, "cooldowns.json")
@@ -260,7 +736,7 @@ function remoteRulesUrl() {
 
 function writeFileSafe(filePath, content) {
   try {
-    const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`
+    const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     try {
       fs.writeFileSync(tmp, content, "utf8")
       fs.renameSync(tmp, filePath)
@@ -269,8 +745,7 @@ function writeFileSafe(filePath, content) {
       try {
         if (fs.existsSync(tmp)) fs.unlinkSync(tmp)
       } catch {}
-      fs.writeFileSync(filePath, content, "utf8")
-      return true
+      return false
     }
   } catch {
     return false
@@ -284,9 +759,22 @@ const GLOBAL_BREAKER_WINDOW_MS = 60 * 1000
 const GLOBAL_BREAKER_COOLDOWN_MS = 10 * 60 * 1000
 const SUSPECT_BREAKER_COOLDOWN_MS = 60 * 1000
 const COOLDOWN_403_MS = 24 * 60 * 60 * 1000
+const COOLDOWN_OAUTH_DEAD_MS = 24 * 60 * 60 * 1000
+const COOLDOWN_QUOTA_EXHAUSTED_FALLBACK_MS = 15 * 60 * 1000
 const COOLDOWN_DEFAULT_MS = 60 * 1000
 const COOLDOWN_MAX_MS = 24 * 60 * 60 * 1000
 const COOLDOWN_PERSIST_MIN_MS = 5 * 60 * 1000
+const timeouts = {
+  headerMs: 32_000,
+  holdSilentMs: 20_000,
+  streamIdleMs: 45_000,
+  cooldownMs: 0,
+  cooldown503Ms: 4_000,
+  cooldown503EscalatedMs: 35_000,
+  window503Ms: 30_000,
+}
+const streak503 = new Map() // "<acctKey>\0<model>" -> { count, firstAt, lastAt }
+const streak503Key = (s, model) => `${accountSalt(s) || s?.rt || "default"}\0${model}`
 let cooldownFileWritten = false
 let cooldownClearCheckedAt = 0
 
@@ -304,6 +792,7 @@ function loadPersistentCooldowns() {
             message: String(v.message ?? "Antigravity: cooldown active"),
             strikes: Number(v.strikes) || 1,
             persisted: true,
+            ...(v.oauthDead ? { oauthDead: true } : {}),
           })
           cooldownFileWritten = true
         }
@@ -314,11 +803,18 @@ function loadPersistentCooldowns() {
 
 function savePersistentCooldowns() {
   try {
+    pruneGlobalMaps()
     const now = Date.now()
     const out = {}
     for (const [k, v] of cooldowns.entries()) {
       if (v && Number.isFinite(v.until) && v.until - now >= COOLDOWN_PERSIST_MIN_MS) {
-        out[k] = { until: v.until, status: v.status, message: v.message, strikes: v.strikes }
+        out[k] = {
+          until: v.until,
+          status: v.status,
+          message: v.message,
+          strikes: v.strikes,
+          ...(v.oauthDead ? { oauthDead: true } : {}),
+        }
       }
     }
     if (Object.keys(out).length === 0) {
@@ -336,10 +832,26 @@ const acctCooldownKey = (s) => `acct:${s.rt}`
 const modelCooldownKey = (s, model) => `model:${s.rt}\0${model}`
 const isRisk429Text = (text) => /Terms of Service|disabled in this account|TOS_VIOLATION|PERMISSION_DENIED|VALIDATION_REQUIRED/i.test(String(text ?? ""))
 
+function isQuotaExhausted429(text) {
+  const s = String(text ?? "")
+  if (/QUOTA_EXHAUSTED|INSUFFICIENT_G1_CREDITS_BALANCE|QuotaFailure|RATE_LIMIT_EXCEEDED|MODEL_CAPACITY_EXHAUSTED/i.test(s)) {
+    return true
+  }
+  const j = parse(s)
+  const err = isObj(j?.error) ? j.error : isObj(j?.response?.error) ? j.response.error : null
+  for (const d of Array.isArray(err?.details) ? err.details : []) {
+    const reason = String(d?.reason ?? "")
+    const typ = String(d?.["@type"] ?? "")
+    if (/QUOTA_EXHAUSTED|INSUFFICIENT_G1_CREDITS_BALANCE|RATE_LIMIT_EXCEEDED|MODEL_CAPACITY_EXHAUSTED/i.test(reason)) return true
+    if (/QuotaFailure/i.test(typ)) return true
+  }
+  return false
+}
+
 function isSuspectRuleBlock(status, headers, text, elapsedMs = null) {
   if (status !== 429) return false
   if (parseRetryDelayMs(headers, text) != null) return false
-  if (/QuotaFailure|RATE_LIMIT_EXCEEDED/i.test(String(text ?? ""))) return false
+  if (isQuotaExhausted429(text)) return false
   if (/resource has been exhausted/i.test(String(text ?? ""))) return true
   return typeof elapsedMs === "number" && elapsedMs < 2500
 }
@@ -417,13 +929,30 @@ function activeCooldown(key) {
 
 function parseDurationMs(val) {
   if (typeof val !== "string") return null
-  const m = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h)?$/i.exec(val.trim())
-  if (!m) return null
-  const n = Number(m[1])
-  if (!Number.isFinite(n) || n <= 0) return null
-  const u = (m[2] || "s").toLowerCase()
-  const mult = u === "ms" ? 1 : u === "m" ? 60_000 : u === "h" ? 3_600_000 : 1000
-  return Math.min(COOLDOWN_MAX_MS, Math.max(10_000, Math.ceil(n * mult)))
+  const s = val.trim()
+  if (!s) return null
+  if (/^\d+(?:\.\d+)?$/.test(s)) {
+    const n = Number(s)
+    if (!Number.isFinite(n) || n <= 0) return null
+    return Math.min(COOLDOWN_MAX_MS, Math.max(10_000, Math.ceil(n * 1000)))
+  }
+  const tokenRe = /(\d+(?:\.\d+)?)\s*(ms|s|m|h)/gi
+  let totalMs = 0
+  let lastIndex = 0
+  let matched = false
+  let m
+  while ((m = tokenRe.exec(s)) !== null) {
+    if (s.slice(lastIndex, m.index).trim() !== "") return null
+    const n = Number(m[1])
+    if (!Number.isFinite(n) || n < 0) return null
+    const u = m[2].toLowerCase()
+    const mult = u === "ms" ? 1 : u === "m" ? 60_000 : u === "h" ? 3_600_000 : 1000
+    totalMs += n * mult
+    lastIndex = m.index + m[0].length
+    matched = true
+  }
+  if (!matched || s.slice(lastIndex).trim() !== "" || !Number.isFinite(totalMs) || totalMs <= 0) return null
+  return Math.min(COOLDOWN_MAX_MS, Math.max(10_000, Math.ceil(totalMs)))
 }
 
 function parseRetryDelayMs(headers, text) {
@@ -438,13 +967,23 @@ function parseRetryDelayMs(headers, text) {
   for (const d of Array.isArray(err?.details) ? err.details : []) {
     const ms = parseDurationMs(d?.retryDelay) ?? parseDurationMs(d?.metadata?.quotaResetDelay)
     if (ms) return ms
-    if (typeof d?.metadata?.quotaResetTimeStamp === "string") {
-      const ts = Date.parse(d.metadata.quotaResetTimeStamp)
+    const tsRaw = d?.metadata?.quotaResetTimeStamp ?? d?.metadata?.quotaResetTimestamp
+    if (typeof tsRaw === "string") {
+      const ts = Date.parse(tsRaw)
       if (Number.isFinite(ts) && ts > Date.now()) return Math.min(COOLDOWN_MAX_MS, Math.max(10_000, ts - Date.now()))
     }
   }
-  const m = /"retryDelay"\s*:\s*"([^"]+)"/i.exec(String(text ?? ""))
-  if (m) return parseDurationMs(m[1])
+  const raw = String(text ?? "")
+  const m = /"(?:retryDelay|quotaResetDelay)"\s*:\s*"([^"]+)"/i.exec(raw)
+  if (m) {
+    const ms = parseDurationMs(m[1])
+    if (ms) return ms
+  }
+  const mt = /"quotaResetTime[Ss]tamp"\s*:\s*"([^"]+)"/.exec(raw)
+  if (mt) {
+    const ts = Date.parse(mt[1])
+    if (Number.isFinite(ts) && ts > Date.now()) return Math.min(COOLDOWN_MAX_MS, Math.max(10_000, ts - Date.now()))
+  }
   return null
 }
 
@@ -502,32 +1041,86 @@ function recordUpstreamFailure(s, model, status, headers, text, ctx = {}) {
     writeSyncTrigger({ status: 429, suspectRuleBlock: true, globalTriggered: true, accounts: gb.accounts })
     void syncRemoteRulesIfNeeded(true)
   }
-  if ((status === 429 || status === 503) && model) {
+  if (status === 503 && model) {
+    const now = Date.now()
+    if (streak503.size > MAX_BOUNDED_CACHE) pruneBoundedMap(streak503, MAX_BOUNDED_CACHE, isStreak503Expired)
+    const sk = streak503Key(s, model)
+    const prevStreak = streak503.get(sk)
+    const streak =
+      !prevStreak || now - prevStreak.firstAt > timeouts.window503Ms
+        ? { count: 1, firstAt: now, lastAt: now }
+        : { count: prevStreak.count + 1, firstAt: prevStreak.firstAt, lastAt: now }
+    streak503.set(sk, streak)
+
     const key = modelCooldownKey(s, model)
     const prev = cooldowns.get(key)
-    const ms = parseRetryDelayMs(headers, text) ?? COOLDOWN_DEFAULT_MS
+    const parsedMs = parseRetryDelayMs(headers, text)
+    const ms =
+      streak.count >= 2
+        ? Math.min(COOLDOWN_MAX_MS, Math.max(parsedMs ?? 0, timeouts.cooldown503EscalatedMs))
+        : Math.min(parsedMs ?? timeouts.cooldown503Ms, 10_000)
+    // Memory-only cooldown for 503: never persists to cooldowns.json, never logs rule-alerts, never triggers global:breaker
+    cooldowns.set(key, { until: now + ms, status, message: msg, strikes: (prev?.strikes ?? 0) + 1, persisted: false })
+    if (cooldowns.size > MAX_COOLDOWN_CACHE) pruneBoundedMap(cooldowns, MAX_COOLDOWN_CACHE, isCooldownExpired)
+    return { cooldownMs: ms, retryAfterSec: Math.max(1, Math.ceil(ms / 1000)), count503: streak.count }
+  }
+  if (status === 429 && model) {
+    const key = modelCooldownKey(s, model)
+    const prev = cooldowns.get(key)
+    const parsedMs = parseRetryDelayMs(headers, text)
+    const ms = parsedMs ?? (isQuotaExhausted429(text) ? COOLDOWN_QUOTA_EXHAUSTED_FALLBACK_MS : COOLDOWN_DEFAULT_MS)
     const persist = ms >= COOLDOWN_PERSIST_MIN_MS
     cooldowns.set(key, { until: Date.now() + ms, status, message: msg, strikes: (prev?.strikes ?? 0) + 1, persisted: persist })
+    if (cooldowns.size > MAX_COOLDOWN_CACHE) pruneBoundedMap(cooldowns, MAX_COOLDOWN_CACHE, isCooldownExpired)
     if (persist) savePersistentCooldowns()
   }
 }
 
 function clearModelCooldown(s, model) {
-  if (model) cooldowns.delete(modelCooldownKey(s, model))
+  if (model) {
+    cooldowns.delete(modelCooldownKey(s, model))
+    streak503.delete(streak503Key(s, model))
+  }
+}
+
+const isTransientTimeout = (status, text) =>
+  status === 504 ||
+  status === 502 ||
+  (status === 500 && /DEADLINE_EXCEEDED|timed?\s*out|timeout/i.test(String(text ?? "")))
+
+// Lightweight short cooldown for transient 504/502/timeout failures:
+// NEVER triggers 24h 403 account ban, NEVER feeds global:breaker, NEVER writes rule-alerts.jsonl.
+function recordTimeoutCooldown(s, model, status, text) {
+  if (!model || !(timeouts.cooldownMs > 0)) return
+  const key = modelCooldownKey(s, model)
+  const prev = cooldowns.get(key)
+  const msg = `Antigravity: ${apiError(text, status)}`
+  const ms = timeouts.cooldownMs
+  cooldowns.set(key, {
+    until: Date.now() + ms,
+    status: status === 502 ? 502 : 504,
+    message: msg,
+    strikes: (prev?.strikes ?? 0) + 1,
+    persisted: false,
+  })
 }
 
 // call is one of Code Assist's methods, its reply's JSON
 async function call(s, base, method, body, headers = {}, signal) {
   const cd = activeCooldown(GLOBAL_BREAKER_KEY) ?? activeCooldown(acctCooldownKey(s))
-  if (cd) throw new StatusError(cd.status, cd.message)
+  if (cd) {
+    if (cd.status === 401 || cd.oauthDead) throw new SignedOut(cd.message)
+    throw new StatusError(cd.status, cd.message)
+  }
   const tok = await token(s)
-  const res = await fetch(`${base}/v1internal:${method}`, {
+  const res = await accountFetch(accountSalt(s) || s.rt, `${base}/v1internal:${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: "Bearer " + tok, "User-Agent": await userAgent(), ...headers },
     body: JSON.stringify(body),
     signal: signal ?? AbortSignal.timeout(60_000),
   })
   const text = (await res.text()).slice(0, 4 << 20)
+  if (res.status === 401) tokens.delete(s.rt)
   if (res.status === 403) recordUpstreamFailure(s, "", 403, res.headers, text)
   if (res.status !== 200) throw new StatusError(res.status, `Antigravity: ${apiError(text, res.status)}`)
   return parse(text) ?? {}
@@ -619,6 +1212,7 @@ async function project(s) {
   if (!p) {
     p = await resolveProject(s)
     projects.set(s.rt, p)
+    if (projects.size > MAX_BOUNDED_CACHE) pruneBoundedMap(projects, MAX_BOUNDED_CACHE, isProjectExpired)
     return p
   }
   if (Date.now() - p.at < TIERS_TTL) return p
@@ -636,6 +1230,7 @@ async function project(s) {
   }
   p = { ...p, at: Date.now() }
   projects.set(s.rt, p)
+  if (projects.size > MAX_BOUNDED_CACHE) pruneBoundedMap(projects, MAX_BOUNDED_CACHE, isProjectExpired)
   return p
 }
 
@@ -685,6 +1280,36 @@ const EFFORT_WORDS = [
   ["high", "high"],
 ]
 
+const validPosInt = (v) => (typeof v === "number" && Number.isInteger(v) && Number.isFinite(v) && v > 0 ? v : 0)
+
+function normalizeThinkingLevel(val) {
+  if (typeof val === "string") {
+    const k = val.trim().toLowerCase().replace(/[_\s]+/g, "-")
+    if (k === "extra-high" || k === "x-high") return "xhigh"
+    if (k === "extra-low" || k === "x-low") return "minimal"
+    return LEVELS.includes(k) ? k : ""
+  }
+  if (typeof val === "number" && Number.isFinite(val)) {
+    if (val <= 0) return "none"
+    if (val < 20) return "minimal"
+    if (val < 40) return "low"
+    if (val < 65) return "medium"
+    if (val < 90) return "high"
+    return "xhigh"
+  }
+  return ""
+}
+
+function deprecatedModels(res) {
+  const out = {}
+  if (!isObj(res?.deprecatedModelIds)) return out
+  for (const [oldId, target] of Object.entries(res.deprecatedModelIds)) {
+    const newId = typeof target === "string" ? target.trim() : isObj(target) && typeof target.newModelId === "string" ? target.newModelId.trim() : ""
+    if (oldId && newId && oldId !== newId) out[oldId] = newId
+  }
+  return out
+}
+
 // splitID is an id's family and the level its last word says
 function splitID(id) {
   for (const [w, l] of EFFORT_WORDS) {
@@ -725,7 +1350,7 @@ function pretty(id) {
 }
 
 // listed is fetchAvailableModels' reply as the account's models: each
-// {id, name, context, output, images, enumName, remaining, resets}, in
+// {id, name, context, output, images, videos, pdfs, thinkingLevel, enumName, remaining, resets}, in
 // the app's picker order
 function listed(res) {
   const models = isObj(res?.models) ? res.models : {}
@@ -733,8 +1358,21 @@ function listed(res) {
   for (const id of Object.keys(models).sort()) {
     const m = models[id] ?? {}
     if (typeof m.model === "string" && m.model) enums.set(id, { model: m.model, provider: typeof m.modelProvider === "string" ? m.modelProvider : "" })
+    if (enums.size > MAX_BOUNDED_CACHE) pruneBoundedMap(enums, MAX_BOUNDED_CACHE)
     if (HIDDEN.has(id) || id.startsWith("chat_") || id.startsWith("tab_") || m.disabled) continue
-    const mi = { id, name: m.displayName ?? "", context: m.maxTokens || 0, output: m.maxOutputTokens || 0, imageInput: typeof m.supportsImages === "boolean" ? m.supportsImages : undefined, remaining: -1, resets: "" }
+    const tl = normalizeThinkingLevel(m.thinkingLevel)
+    const mi = {
+      id,
+      name: m.displayName ?? "",
+      context: validPosInt(m.maxTokens),
+      output: validPosInt(m.maxOutputTokens),
+      imageInput: typeof m.supportsImages === "boolean" ? m.supportsImages : undefined,
+      videoInput: typeof m.supportsVideo === "boolean" ? m.supportsVideo : undefined,
+      pdfInput: typeof m.supportsPdf === "boolean" ? m.supportsPdf : undefined,
+      ...(tl ? { thinkingLevel: tl } : {}),
+      remaining: -1,
+      resets: "",
+    }
     if (isObj(m.quotaInfo)) {
       // Antigravity leaves the fraction out once none is left
       mi.remaining = typeof m.quotaInfo.remainingFraction === "number" ? m.quotaInfo.remainingFraction : 0
@@ -756,17 +1394,20 @@ function listed(res) {
 }
 
 // catalogOf is the account's models as magpie lists the variants: names
-// filled, images said
+// filled, images/videos/pdfs said
 function catalogOf(infos) {
   const names = Object.fromEntries(FALLBACK.map((m) => [m.id, m.name]))
   const out = infos.map((mi) => ({
     id: mi.id,
     name: mi.name || names[mi.id] || "",
-    context: mi.context,
-    output: mi.output,
+    context: validPosInt(mi.context),
+    output: validPosInt(mi.output),
     images: mi.imageInput ?? !mi.id.startsWith("gpt-oss"),
+    videos: mi.videoInput ?? false,
+    pdfs: mi.pdfInput ?? false,
+    ...(mi.thinkingLevel ? { thinkingLevel: mi.thinkingLevel } : {}),
   }))
-  if (!out.length) return FALLBACK.map((m) => ({ ...m, context: 0, output: 0, images: !m.id.startsWith("gpt-oss") }))
+  if (!out.length) return FALLBACK.map((m) => ({ ...m, context: 0, output: 0, images: !m.id.startsWith("gpt-oss"), videos: false, pdfs: false }))
   return out
 }
 
@@ -788,10 +1429,14 @@ function families(raw) {
   for (const f of out) {
     const named = []
     for (const v of f.variants) {
-      const l = nameEffort(v.name)[1]
+      const l = v.thinkingLevel || nameEffort(v.name)[1]
       if (l && !named.includes(l)) named.push(l)
     }
-    for (const v of f.variants) f.efforts.push(named.length === f.variants.length ? nameEffort(v.name)[1] : splitID(v.id)[1])
+    for (const v of f.variants) {
+      const tl = normalizeThinkingLevel(v.thinkingLevel)
+      if (tl) f.efforts.push(tl)
+      else f.efforts.push(named.length === f.variants.length ? nameEffort(v.name)[1] : splitID(v.id)[1])
+    }
   }
   return out
 }
@@ -819,6 +1464,8 @@ function familyModel(f) {
     if (v.context > 0 && (m.context === 0 || v.context < m.context)) m.context = v.context
     if (v.output > 0 && (m.output === 0 || v.output < m.output)) m.output = v.output
     m.images = m.images && v.images
+    m.videos = Boolean(m.videos && v.videos)
+    m.pdfs = Boolean(m.pdfs && v.pdfs)
   }
   m.efforts = LEVELS.filter((l) => f.efforts.includes(l))
   return m
@@ -831,13 +1478,13 @@ function collapse(raw) {
   for (const f of families(raw)) out.push(f.variants.length === 1 ? { ...f.variants[0], efforts: [] } : familyModel(f))
   const byID = new Map(out.map((m) => [m.id, m]))
   for (const m of out) {
-    const tiered = m.id.endsWith("-tiered")
-    const b = tiered ? m.id.slice(0, -7) : ""
-    const base = tiered ? byID.get(b) : undefined
+    const suffix = m.id.endsWith("-tiered") ? "-tiered" : m.id.endsWith("-sonar") ? "-sonar" : ""
+    const b = suffix ? m.id.slice(0, -suffix.length) : ""
+    const base = suffix ? byID.get(b) : undefined
     if (base && !m.efforts.length) m.efforts = [...base.efforts]
     if (m.name) continue
     m.name = m.id
-    if (base && base.name && base.name !== b) m.name = base.name + " (Tiered)"
+    if (base && base.name && base.name !== b) m.name = base.name + (suffix === "-tiered" ? " (Tiered)" : " (Sonar)")
   }
   return out
 }
@@ -862,7 +1509,20 @@ function nearestEffort(want, levels) {
 
 // sentID is the id a request for model at effort goes out under, and the
 // level that id says it thinks at
-function sentID(raw, model, effort) {
+function sentID(raw, model, effort, deprecated) {
+  if (isObj(deprecated) && deprecated[model]) {
+    const seen = new Set()
+    let cur = model
+    let inheritedEffort = ""
+    while (deprecated[cur] && !seen.has(cur)) {
+      seen.add(cur)
+      const [, oldEffort] = splitID(cur)
+      if (!inheritedEffort && oldEffort) inheritedEffort = oldEffort
+      cur = deprecated[cur]
+    }
+    model = cur
+    if (!effort && inheritedEffort) effort = inheritedEffort
+  }
   const fams = families(raw)
   if (effort) {
     for (const f of fams) {
@@ -877,7 +1537,14 @@ function sentID(raw, model, effort) {
   const f = fams.find((x) => x.id === model && x.variants.length > 1)
   if (!f) {
     const g = fams.find((x) => x.variants.length > 1 && x.variants.some((v) => v.id === model))
-    return [model, g ? g.efforts[g.variants.findIndex((v) => v.id === model)] : ""]
+    if (g) return [model, g.efforts[g.variants.findIndex((v) => v.id === model)] || ""]
+    const singleFam = fams.find((x) => x.id === model || x.variants.some((v) => v.id === model))
+    if (singleFam) {
+      const idx = singleFam.variants.findIndex((v) => v.id === model)
+      const vi = idx >= 0 ? idx : 0
+      return [singleFam.variants[vi].id, singleFam.efforts[vi] || singleFam.variants[vi].thinkingLevel || ""]
+    }
+    return [model, ""]
   }
   const vs = byEffort(f)
   let id = vs[""]
@@ -888,7 +1555,7 @@ function sentID(raw, model, effort) {
   return [id, f.efforts[f.variants.findIndex((v) => v.id === id)] ?? ""]
 }
 
-const lists = new Map() // refresh token → {at, infos, project}
+const lists = new Map() // refresh token → {at, infos, project, deprecated}
 
 // modelInfo reads the account's models, naming its tiers as the app does
 async function modelInfo(s, fresh = false) {
@@ -906,12 +1573,16 @@ async function modelInfo(s, fresh = false) {
     } catch (e) {
       err = e
       if (e instanceof SignedOut) throw e
-      if (t && e.status === 400) refused.set(tierKey(s, p, t), Date.now())
+      if (t && e.status === 400) {
+        refused.set(tierKey(s, p, t), Date.now())
+        if (refused.size > MAX_BOUNDED_CACHE) pruneBoundedMap(refused, MAX_BOUNDED_CACHE, isRefusedExpired)
+      }
     }
   }
   if (err) throw err
-  const out = { at: Date.now(), infos: listed(res), project: p }
+  const out = { at: Date.now(), infos: listed(res), project: p, deprecated: deprecatedModels(res) }
   lists.set(s.rt, out)
+  if (lists.size > MAX_BOUNDED_CACHE) pruneBoundedMap(lists, MAX_BOUNDED_CACHE, isListExpired)
   return out
 }
 
@@ -920,17 +1591,21 @@ function variantsOf(m) {
 }
 
 function entry(m) {
+  const inputModalities = ["text"]
+  if (m.images) inputModalities.push("image")
+  if (m.videos) inputModalities.push("video")
+  if (m.pdfs) inputModalities.push("pdf")
   return {
     id: m.id,
     name: m.name || m.id,
     provider: { npm: NPM, api: BASE },
-    reasoning: m.efforts.length > 0 || /thinking|gemini|pro-agent/i.test(m.id),
-    attachment: !!m.images,
+    reasoning: m.efforts.length > 0 || Boolean(m.thinkingLevel) || /thinking|gemini|pro-agent/i.test(m.id),
+    attachment: !!(m.images || m.videos || m.pdfs),
     tool_call: true,
     temperature: true,
-    modalities: { input: m.images ? ["text", "image"] : ["text"], output: ["text"] },
+    modalities: { input: inputModalities, output: ["text"] },
     cost: { input: 0, output: 0 },
-    limit: { context: m.context || 0, output: m.output || 0 },
+    limit: { context: validPosInt(m.context), output: validPosInt(m.output) },
     variants: variantsOf(m),
   }
 }
@@ -952,7 +1627,7 @@ function model(m) {
       reasoning: e.reasoning,
       attachment: e.attachment,
       toolcall: true,
-      input: { text: true, image: e.attachment, audio: false, video: false, pdf: false },
+      input: { text: true, image: !!m.images, audio: false, video: !!m.videos, pdf: !!m.pdfs },
       output: { text: true, image: false, audio: false, video: false, pdf: false },
       interleaved: false,
     },
@@ -963,7 +1638,7 @@ function model(m) {
 
 // ---- the schema Antigravity's function declarations take ---------------------------------
 
-const KEEP = new Set(["description", "nullable", "required", "pattern", "minimum", "maximum", "minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties", "propertyOrdering"])
+const KEEP = new Set(["description", "nullable", "required", "pattern", "format", "default", "minimum", "maximum", "minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties", "propertyOrdering"])
 
 function requiredNames(v) {
   return Array.isArray(v) ? v.filter((e) => typeof e === "string") : []
@@ -1165,9 +1840,8 @@ function plainSchema(root) {
           out.maxItems = 0
         }
       } else if (k === "enum") {
-        if (Array.isArray(val) && val.every((e) => typeof e === "string")) {
-          const strs = val.filter((s) => s.trim() !== "")
-          if (strs.length) out.enum = strs
+        if (Array.isArray(val) && val.length > 0 && val.every((e) => typeof e === "string" && e.trim() !== "")) {
+          out.enum = val
         }
       }
     }
@@ -1259,11 +1933,19 @@ const TURNED_AWAY = [
   "you are a coding agent running in the codex cli",
   "you are a coding assistant inside pi-bolt",
   "a coding assistant inside pi-bolt",
+  "a coding assistant running inside pi",
+  "a coding assistant running within pi",
   "a coding assistant inside pi",
   "running inside pi",
+  "running within pi",
   "a coding agent harness",
   "you are an ai agent powered by deepseek harness",
+  "the browser provides no implicit dom, route, or screenshot context.",
   "you are claude code, anthropic's official cli for claude",
+  "you're claude code, anthropic's official cli for claude",
+  "you are claude code",
+  "you're claude code",
+  "anthropic's official cli for claude",
   "you are an interactive agent that helps users with software engineering tasks",
   "prefer read_file, edit_file, and write_file over cat/sed",
   "always read_file before edit_file",
@@ -1303,7 +1985,7 @@ const SAID_AS = {
   "x-anthropic-billing-header:": () => "",
   [CLAUDE_AGENT_SDK_FULL]: () => "You are an AI coding assistant.",
   [CLAUDE_CODE_SDK_FULL]: () => "You are an AI coding assistant.",
-  "built on anthropic's claude agent sdk": (line) => line.replace(/^(built\s+on\s+)anthropic's(\s+)(claude\s+agent\s+sdk)$/i, "$1the$2$3 by Anthropic"),
+  "built on anthropic's claude agent sdk": () => "built on a standard agent framework",
   "you are codex, an agent based on gpt-5": (line) => line.replace(/based(\s+)on/i, "built$1on"),
   "you are codex, a coding agent based on gpt-5": (line) => line.replace(/based(\s+)on/i, "built$1on"),
   "you are codex, an agent based on gpt-6": (line) => line.replace(/based(\s+)on/i, "built$1on"),
@@ -1313,13 +1995,21 @@ const SAID_AS = {
   "an intelligent ai assistant created by nous research": (line) => line.replace(/created(\s+)by/i, "built$1by"),
   "you are opencode": youre,
   "you are a coding agent running in the codex cli": youre,
-  "you are a coding assistant inside pi-bolt": (line) => line.replace(/inside\s+pi-bolt$/i, "within a tool"),
-  "a coding assistant inside pi-bolt": (line) => line.replace(/inside\s+pi-bolt$/i, "within a tool"),
-  "a coding assistant inside pi": (line) => line.replace(/inside/i, "within"),
-  "running inside pi": (line) => line.replace(/inside/i, "within"),
+  "you are a coding assistant inside pi-bolt": () => "You are a coding assistant in a workspace",
+  "a coding assistant inside pi-bolt": () => "a coding assistant in a workspace",
+  "a coding assistant running inside pi": () => "a coding assistant in a coding workspace",
+  "a coding assistant running within pi": () => "a coding assistant in a coding workspace",
+  "a coding assistant inside pi": () => "a coding assistant in a coding workspace",
+  "running inside pi": () => "running in the workspace",
+  "running within pi": () => "running in the workspace",
   "a coding agent harness": () => "a coding workspace",
   "you are an ai agent powered by deepseek harness": youre,
+  "the browser provides no implicit dom, route, or screenshot context.": (line) => line.replace(/provides/i, "gives"),
   "you are claude code, anthropic's official cli for claude": () => "You are an AI coding assistant",
+  "you're claude code, anthropic's official cli for claude": () => "You are an AI coding assistant",
+  "you are claude code": () => "You are an AI coding assistant",
+  "you're claude code": () => "You are an AI coding assistant",
+  "anthropic's official cli for claude": () => "a coding assistant CLI",
   "you are an interactive agent that helps users with software engineering tasks": () => "You're an interactive coding helper for software engineering tasks",
   "prefer read_file, edit_file, and write_file over cat/sed": () => "use dedicated file tools instead of cat/sed",
   "always read_file before edit_file": () => "always inspect the file before editing",
@@ -1342,10 +2032,36 @@ const dynamicState = {
   reworded: [],
   userTurnedAway: new Set(USER_TURNED_AWAY),
   systemTag: DEFAULT_SYSTEM_TAG,
+  cls: { ...CLS },
+  defaultVersion: DEFAULT_VERSION,
+  resolvedVersion: DEFAULT_VERSION,
+}
+
+const POISON_VALUE_RE = /you['’]?re\s+claude\s+code|\b(?:inside|within)\s+pi(?:-bolt)?\b/i
+
+function isForbiddenDynamicRule(phraseNorm, val) {
+  if (typeof val !== "string") return true
+  const valNorm = val.trim().toLowerCase().replace(/\s+/g, " ")
+  if (phraseNorm === valNorm) return true
+  if (POISON_VALUE_RE.test(val)) return true
+  return false
+}
+
+function sanitizeClientMeta(rawMeta) {
+  const cls = { ...CLS }
+  if (isObj(rawMeta?.cls)) {
+    for (const [k, v] of Object.entries(rawMeta.cls)) {
+      const vk = String(k ?? "").trim()
+      const cv = String(v ?? "").trim()
+      if (/^\d+(?:\.\d+)+$/.test(vk) && /^\d+$/.test(cv)) cls[vk] = cv
+    }
+  }
+  const rawDef = typeof rawMeta?.defaultVersion === "string" ? rawMeta.defaultVersion.trim() : ""
+  const defaultVersion = cls[rawDef] ? rawDef : highestKnownVersion(cls)
+  return { cls, defaultVersion }
 }
 
 function systemTagName() {
-  reloadDynamicRules()
   return dynamicState.systemTag || DEFAULT_SYSTEM_TAG
 }
 
@@ -1361,28 +2077,28 @@ function applyDynamicRulesData(data, mtimeMs = dynamicState.mtimeMs) {
   if (!isObj(data)) return false
   const builtinSet = new Set(TURNED_AWAY)
   const rulesByPhrase = new Map()
-  // 1) Upstream synced saidAs (cannot override built-in protected rules like inside pi / Claude neutral)
+  // 1) Upstream synced saidAs (cannot override built-in protected rules, self-mappings, or poison rules)
   if (isObj(data?.saidAs)) {
     for (const [k, v] of Object.entries(data.saidAs)) {
       if (typeof v !== "string") continue
       const comp = compileDynamicPattern(k)
-      if (!comp || builtinSet.has(comp.phrase)) continue
+      if (!comp || builtinSet.has(comp.phrase) || isForbiddenDynamicRule(comp.phrase, v)) continue
       rulesByPhrase.set(comp.phrase, { ...comp, as: () => v })
     }
   }
-  // 2) Manual customRules (highest priority for user-added dynamic rules)
+  // 2) Manual customRules (highest priority for user-added dynamic rules, still rejecting self/poison)
   if (isObj(data?.customRules)) {
     for (const [k, v] of Object.entries(data.customRules)) {
       if (typeof v !== "string") continue
       const comp = compileDynamicPattern(k)
-      if (!comp) continue
+      if (!comp || isForbiddenDynamicRule(comp.phrase, v)) continue
       rulesByPhrase.set(comp.phrase, { ...comp, as: () => v })
     }
   }
   const reworded = []
   if (Array.isArray(data?.reworded)) {
     for (const pair of data.reworded) {
-      if (Array.isArray(pair) && pair.length >= 2 && typeof pair[0] === "string" && typeof pair[1] === "string" && pair[0]) {
+      if (Array.isArray(pair) && pair.length >= 2 && typeof pair[0] === "string" && typeof pair[1] === "string" && pair[0] && pair[0] !== pair[1]) {
         reworded.push([pair[0], pair[1]])
       }
     }
@@ -1393,6 +2109,15 @@ function applyDynamicRulesData(data, mtimeMs = dynamicState.mtimeMs) {
       if (typeof line === "string" && line.trim()) uta.add(line.trim().toLowerCase())
     }
   }
+  const { cls, defaultVersion } = sanitizeClientMeta(data?.clientMeta)
+  const prevResolved = dynamicState.resolvedVersion
+  dynamicState.cls = cls
+  dynamicState.defaultVersion = defaultVersion
+  const nextResolved = resolveVersion(ver.v || defaultVersion, cls)
+  dynamicState.resolvedVersion = nextResolved
+  if (prevResolved && nextResolved && prevResolved !== nextResolved) {
+    try { lists.clear() } catch {}
+  }
   // Sort longer phrases first so more specific matches win at the same index
   const rawTag = typeof data?.systemTag === "string" ? data.systemTag.trim() : ""
   dynamicState.systemTag = VALID_SYSTEM_TAG_RE.test(rawTag) ? rawTag : DEFAULT_SYSTEM_TAG
@@ -1400,6 +2125,7 @@ function applyDynamicRulesData(data, mtimeMs = dynamicState.mtimeMs) {
   dynamicState.reworded = reworded
   dynamicState.userTurnedAway = uta
   dynamicState.mtimeMs = mtimeMs
+  dynamicState.checkedAt = Date.now()
   return true
 }
 
@@ -1417,6 +2143,9 @@ function reloadDynamicRules(force = false) {
       dynamicState.reworded = []
       dynamicState.userTurnedAway = new Set(USER_TURNED_AWAY)
       dynamicState.systemTag = DEFAULT_SYSTEM_TAG
+      dynamicState.cls = { ...CLS }
+      dynamicState.defaultVersion = DEFAULT_VERSION
+      dynamicState.resolvedVersion = resolveVersion(ver.v || DEFAULT_VERSION, dynamicState.cls)
     }
     return
   }
@@ -1428,18 +2157,26 @@ function reloadDynamicRules(force = false) {
 }
 
 function mergeRemoteRulesDoc(local, remote) {
-  const mergedSaidAs = {
+  const builtinSet = new Set(TURNED_AWAY)
+  const rawMergedSaidAs = {
     ...(isObj(local?.saidAs) ? local.saidAs : {}),
     ...(isObj(remote?.saidAs) ? remote.saidAs : {}),
   }
+  const cleanSaidAs = {}
+  for (const [k, v] of Object.entries(rawMergedSaidAs)) {
+    if (typeof v !== "string") continue
+    const comp = compileDynamicPattern(k)
+    if (!comp || builtinSet.has(comp.phrase) || isForbiddenDynamicRule(comp.phrase, v)) continue
+    cleanSaidAs[comp.phrase] = v
+  }
   const rewordMap = new Map()
   for (const pair of Array.isArray(local?.reworded) ? local.reworded : []) {
-    if (Array.isArray(pair) && pair.length >= 2 && typeof pair[0] === "string" && typeof pair[1] === "string" && pair[0]) {
+    if (Array.isArray(pair) && pair.length >= 2 && typeof pair[0] === "string" && typeof pair[1] === "string" && pair[0] && pair[0] !== pair[1]) {
       rewordMap.set(pair[0], pair[1])
     }
   }
   for (const pair of Array.isArray(remote?.reworded) ? remote.reworded : []) {
-    if (Array.isArray(pair) && pair.length >= 2 && typeof pair[0] === "string" && typeof pair[1] === "string" && pair[0]) {
+    if (Array.isArray(pair) && pair.length >= 2 && typeof pair[0] === "string" && typeof pair[1] === "string" && pair[0] && pair[0] !== pair[1]) {
       rewordMap.set(pair[0], pair[1])
     }
   }
@@ -1449,10 +2186,23 @@ function mergeRemoteRulesDoc(local, remote) {
       if (typeof line === "string" && line.trim()) uta.add(line.trim().toLowerCase())
     }
   }
-  const customRules = {
-    ...(isObj(remote?.customRules) ? remote.customRules : {}),
-    ...(isObj(local?.customRules) ? local.customRules : {}),
+  const customRules = {}
+  for (const src of [remote?.customRules, local?.customRules]) {
+    if (!isObj(src)) continue
+    for (const [k, v] of Object.entries(src)) {
+      if (typeof v !== "string") continue
+      const comp = compileDynamicPattern(k)
+      if (!comp || isForbiddenDynamicRule(comp.phrase, v)) continue
+      customRules[comp.phrase] = v
+    }
   }
+  const mergedMeta = sanitizeClientMeta({
+    cls: {
+      ...(isObj(local?.clientMeta?.cls) ? local.clientMeta.cls : {}),
+      ...(isObj(remote?.clientMeta?.cls) ? remote.clientMeta.cls : {}),
+    },
+    defaultVersion: remote?.clientMeta?.defaultVersion ?? local?.clientMeta?.defaultVersion,
+  })
   const localTag = typeof local?.systemTag === "string" ? local.systemTag.trim() : ""
   const remoteTag = typeof remote?.systemTag === "string" ? remote.systemTag.trim() : ""
   const systemTag = VALID_SYSTEM_TAG_RE.test(localTag) ? localTag : VALID_SYSTEM_TAG_RE.test(remoteTag) ? remoteTag : DEFAULT_SYSTEM_TAG
@@ -1460,8 +2210,9 @@ function mergeRemoteRulesDoc(local, remote) {
     version: Number(remote?.version) || Number(local?.version) || 1,
     updatedAt: typeof remote?.updatedAt === "string" && remote.updatedAt ? remote.updatedAt : new Date().toISOString(),
     systemTag,
+    clientMeta: mergedMeta,
     ...(isObj(remote?.upstream) ? { upstream: remote.upstream } : isObj(local?.upstream) ? { upstream: local.upstream } : {}),
-    saidAs: Object.fromEntries(Object.entries(mergedSaidAs).sort(([a], [b]) => a.localeCompare(b))),
+    saidAs: Object.fromEntries(Object.entries(cleanSaidAs).sort(([a], [b]) => a.localeCompare(b))),
     reworded: [...rewordMap.entries()],
     userTurnedAway: [...uta].sort(),
     customRules,
@@ -1517,14 +2268,12 @@ async function syncRemoteRulesIfNeeded(force = false) {
 }
 
 function allTurnsAway(system) {
-  reloadDynamicRules()
   if (typeof system !== "string" || !system) return false
   if (turnsAway(system)) return true
   return dynamicState.rules.some((r) => has(system, r.re))
 }
 
 function cloak(system, only) {
-  reloadDynamicRules()
   if (typeof system !== "string" || !system) return system
   const at = []
   const scan = (re, fn) => {
@@ -1638,24 +2387,94 @@ const REWORDED = [
 ]
 
 const reword = (system) => {
-  reloadDynamicRules()
   for (const [from, to] of REWORDED) if (system.includes(from)) system = system.split(from).join(to)
   for (const [from, to] of dynamicState.reworded) if (system.includes(from)) system = system.split(from).join(to)
   return system
 }
 
+const PI_WEB_SANITIZERS = [
+  [/@agegr\/pi-web/gi, "@agent-ui/web-workspace"],
+  [/@earendil-works\/pi-coding-agent/gi, "@workspace/coding-agent"],
+  [/\bpi-coding-agent\b/gi, "coding-agent"],
+  [/\bPi-Web\b/gi, "Agent-Web"],
+  [/\bPiMet\b/gi, "MobileClient"],
+  [/\bpimet-browser\b/gi, "mobile-browser"],
+  [/\brunning\s+(?:inside|within)\s+pi\b/gi, "running in the workspace"],
+  [/\b(?:inside|within)\s+pi\b/gi, "in the workspace"],
+  [/\bAGENTS\.md\b/g, "INSTRUCTIONS.md"],
+  [SESSION_MOVE_RE, "tools.session_transfer"],
+]
+
+function sanitizePiWeb(text) {
+  let out = text
+  for (const [re, rep] of PI_WEB_SANITIZERS) out = out.replace(re, rep)
+  return out
+}
+
 // outgoing is a system prompt as Antigravity is sent it
-const outgoing = (system) => (typeof system === "string" ? reword(cloak(system)).replace(SESSION_MOVE_RE, "tools.session_transfer") : system)
+const outgoing = (system) => (typeof system === "string" ? sanitizePiWeb(reword(cloak(system))) : system)
+
+function sanitizeResponseValue(v, depth = 0) {
+  if (depth > 32) return v
+  if (typeof v === "string") return outgoing(v)
+  if (Array.isArray(v)) return v.map((item) => sanitizeResponseValue(item, depth + 1))
+  if (isObj(v)) {
+    const out = {}
+    for (const [k, val] of Object.entries(v)) out[k] = sanitizeResponseValue(val, depth + 1)
+    return out
+  }
+  return v
+}
+
+function sanitizeSchemaDescriptions(node, depth = 0) {
+  if (depth > 32) return node
+  if (Array.isArray(node)) {
+    for (const item of node) sanitizeSchemaDescriptions(item, depth + 1)
+    return node
+  }
+  if (!isObj(node)) return node
+  if (typeof node.description === "string") node.description = outgoing(node.description)
+  if (isObj(node.properties)) {
+    for (const pv of Object.values(node.properties)) sanitizeSchemaDescriptions(pv, depth + 1)
+  }
+  if (node.items != null) sanitizeSchemaDescriptions(node.items, depth + 1)
+  return node
+}
 
 const DEFAULT_ANTIGRAVITY_SYSTEM =
   "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding."
 
+function sanitizeInjectedUserText(text, isFirstUserTurn, tag) {
+  if (typeof text !== "string" || !text) return text
+  const trimmed = text.trimStart()
+  if (!trimmed) return text
+  if (isFirstUserTurn && INJECTED_USER_TEXT.test(trimmed)) {
+    return outgoing(text)
+  }
+  const tagRe = new RegExp(`<${escape(tag)}(?:\\s[^>]*)?>[\\s\\S]*?<\\/${escape(tag)}>`, "g")
+  let out = text
+  if (out.includes(`<${tag}`)) {
+    if (tagRe.test(out)) {
+      tagRe.lastIndex = 0
+      out = out.replace(tagRe, (block) => outgoing(block))
+    } else if (trimmed.startsWith(`<${tag}>`) || trimmed.startsWith(`<${tag} `)) {
+      out = outgoing(out)
+    }
+  }
+  if (isFirstUserTurn && dynamicState.userTurnedAway.size) {
+    out = cloak(out, [...dynamicState.userTurnedAway])
+  }
+  return out
+}
+
 // shape is the Gemini request as Antigravity takes it for the model sent
 // at the level at, asked at effort
 function shape(req, sent, at, effort, preSanitizedSystem) {
+  reloadDynamicRules()
   req = structuredClone(req)
   const m = sent.toLowerCase()
   const claude = m.includes("claude")
+  const tag = systemTagName()
   const sysParts = []
   if (isObj(req.systemInstruction)) {
     const parts = req.systemInstruction.parts ?? []
@@ -1678,6 +2497,7 @@ function shape(req, sent, at, effort, preSanitizedSystem) {
 
   if (Array.isArray(req.contents)) {
     const cleanedContents = []
+    let seenFirstUser = false
     for (const c of req.contents) {
       if (c?.role === "developer" || c?.role === "system") {
         const nonText = []
@@ -1692,7 +2512,15 @@ function shape(req, sent, at, effort, preSanitizedSystem) {
         if (nonText.length) cleanedContents.push({ ...c, role: "user", parts: nonText })
         continue
       }
-      for (const p of c?.parts ?? []) if (typeof p?.text === "string" && !p.thought) p.text = outgoing(p.text)
+      const isFirstUserTurn = c?.role === "user" && !seenFirstUser
+      if (c?.role === "user") {
+        seenFirstUser = true
+        for (const p of c?.parts ?? []) {
+          if (typeof p?.text === "string" && !p.thought) {
+            p.text = sanitizeInjectedUserText(p.text, isFirstUserTurn, tag)
+          }
+        }
+      }
       if (Array.isArray(c?.parts) && c.parts.length > 1) c.parts = c.parts.filter((p) => !(isObj(p) && p.text === "" && Object.keys(p).length === 1))
       for (const p of c?.parts ?? []) {
         if (isObj(p?.functionCall) && p.functionCall.id) p.functionCall.id = toolID(p.functionCall.id)
@@ -1713,7 +2541,6 @@ function shape(req, sent, at, effort, preSanitizedSystem) {
   }
 
   if (sysParts.length) {
-    const tag = systemTagName()
     const extBlock = { text: `<${tag}>\n${sysParts.join("\n\n")}\n</${tag}>` }
     if (!Array.isArray(req.contents)) req.contents = []
     if (req.contents[0]?.role === "user") {
@@ -1725,37 +2552,44 @@ function shape(req, sent, at, effort, preSanitizedSystem) {
 
   for (const t of Array.isArray(req.tools) ? req.tools : []) {
     for (const d of Array.isArray(t?.functionDeclarations) ? t.functionDeclarations : []) {
-      if (typeof d.description === "string" && allTurnsAway(d.description)) {
+      if (typeof d.description === "string") {
         d.description = outgoing(d.description)
       }
       const s = d.parametersJsonSchema ?? d.parameters ?? { type: "object", properties: {} }
       delete d.parametersJsonSchema
-      d.parameters = plainSchema(structuredClone(s))
+      d.parameters = sanitizeSchemaDescriptions(plainSchema(structuredClone(s)))
     }
   }
   const fc = req.toolConfig?.functionCallingConfig
   if (claude && isObj(fc) && (fc.mode ?? "AUTO") === "AUTO" && Array.isArray(req.tools) && req.tools.some((t) => t?.functionDeclarations?.length)) fc.mode = "VALIDATED"
+  const g = generation(m)
+  const supportsThinking = !m.startsWith("gpt-oss") && !(claude && !m.includes("thinking")) && (g >= 3 || m.startsWith("gemini-pro-agent"))
+  const e = at || effort
+  if (supportsThinking && e && !isObj(req.generationConfig)) req.generationConfig = {}
   const gen = isObj(req.generationConfig) ? req.generationConfig : null
   if (gen) {
-    if (!claude) delete gen.maxOutputTokens
+    if (!claude || typeof gen.maxOutputTokens !== "number" || !Number.isInteger(gen.maxOutputTokens) || gen.maxOutputTokens <= 0) {
+      delete gen.maxOutputTokens
+    }
+    if (supportsThinking && e && !isObj(gen.thinkingConfig)) gen.thinkingConfig = {}
     const tc = gen.thinkingConfig
     if (m.startsWith("gpt-oss") || (claude && !m.includes("thinking"))) delete gen.thinkingConfig
     else if (isObj(tc)) {
-      const g = generation(m)
       if (g >= 3 || m.startsWith("gemini-pro-agent")) {
-        const e = at || effort
         delete tc.thinkingBudget
         tc.includeThoughts = true
-        if (e) {
+        const reqLevel = normalizeThinkingLevel(tc.thinkingLevel)
+        const eff = e || reqLevel
+        if (eff) {
           let level = "high"
-          if (e === "low" || (e === "minimal" && at && !m.includes("flash"))) level = "low"
-          else if (e === "minimal" && at) level = "minimal"
-          else if ((e === "none" || e === "minimal") && !draws(m)) level = "low"
-          else if (e === "medium" && (m.includes("flash") || g > 3)) level = "medium"
-          if (at === "xhigh") level = "xhigh"
+          if (eff === "low" || (eff === "minimal" && at && !m.includes("flash"))) level = "low"
+          else if (eff === "minimal" && at) level = "minimal"
+          else if ((eff === "none" || eff === "minimal") && !draws(m)) level = "low"
+          else if (eff === "medium" && (m.includes("flash") || g > 3)) level = "medium"
+          if (at === "xhigh" || (!at && eff === "xhigh" && g >= 4)) level = "xhigh"
           tc.thinkingLevel = level
         } else delete tc.thinkingLevel
-      } else if (typeof tc.thinkingLevel === "string") {
+      } else if (tc.thinkingLevel !== undefined) {
         delete tc.thinkingLevel
         if (Object.keys(tc).length === 1 && tc.includeThoughts && !("thinkingBudget" in tc)) delete gen.thinkingConfig
       }
@@ -1765,7 +2599,7 @@ function shape(req, sent, at, effort, preSanitizedSystem) {
   return req
 }
 
-const INJECTED_USER_TEXT = /^(?:# AGENTS\.md\b|<(?:external_system_instructions|environment_context|permissions instructions|system-reminder|external_codex_apps_|subagent[-_]notification|turn_aborted)\b|\{"page_id":|Companion Page snapshot\b)/
+const INJECTED_USER_TEXT = /^(?:# (?:AGENTS|INSTRUCTIONS)\.md\b|<(?:external_system_instructions|environment_context|permissions instructions|system-reminder|external_codex_apps_|subagent[-_]notification|turn_aborted)\b|\{"page_id":|Companion Page snapshot\b)/
 
 function firstUserText(req) {
   const tag = systemTagName()
@@ -1875,7 +2709,17 @@ function headerOf(headers, name) {
 }
 
 function errorResponse(status, message, signIn) {
-  const statusName = { 400: "INVALID_ARGUMENT", 401: "UNAUTHENTICATED", 403: "PERMISSION_DENIED", 404: "NOT_FOUND", 429: "RESOURCE_EXHAUSTED" }[status] ?? "UNKNOWN"
+  const statusName =
+    {
+      400: "INVALID_ARGUMENT",
+      401: "UNAUTHENTICATED",
+      403: "PERMISSION_DENIED",
+      404: "NOT_FOUND",
+      429: "RESOURCE_EXHAUSTED",
+      502: "BAD_GATEWAY",
+      503: "UNAVAILABLE",
+      504: "DEADLINE_EXCEEDED",
+    }[status] ?? "UNKNOWN"
   return new Response(JSON.stringify({ error: { code: status, message, status: statusName } }), {
     status,
     headers: { "content-type": "application/json", ...(signIn ? { "x-magpie-sign-in": signIn } : {}) },
@@ -1968,6 +2812,64 @@ function showsAnswer(j) {
 // ({bad: true}). Once an answer has begun the client has it, and the
 // stream goes through as it is: a reply can't be taken back.
 const LATE = Symbol("late")
+function withIdleTimeout(body, idleMs = timeouts.streamIdleMs, onFinalize) {
+  if (!body) {
+    onFinalize?.()
+    return body
+  }
+  const rd = body.getReader()
+  let finished = false
+  let activeRead = null
+  const finish = () => {
+    if (finished) return
+    finished = true
+    onFinalize?.()
+  }
+  return new ReadableStream({
+    async pull(ctl) {
+      let timer
+      try {
+        const read = activeRead ?? rd.read()
+        activeRead = read
+        const r = await Promise.race([
+          read,
+          new Promise((resolve) => {
+            timer = setTimeout(() => resolve(LATE), idleMs)
+          }),
+        ])
+        clearTimeout(timer)
+        if (r === LATE) {
+          activeRead?.catch(() => {})
+          activeRead = null
+          const err = new StatusError(504, "antigravity upstream stream idle timeout")
+          await rd.cancel(err).catch(() => {})
+          finish()
+          ctl.error(err)
+          return
+        }
+        activeRead = null
+        if (r.done) {
+          finish()
+          ctl.close()
+        } else {
+          ctl.enqueue(r.value)
+        }
+      } catch (e) {
+        clearTimeout(timer)
+        activeRead = null
+        finish()
+        ctl.error(e)
+      }
+    },
+    async cancel(reason) {
+      activeRead?.catch(() => {})
+      activeRead = null
+      finish()
+      await rd.cancel(reason).catch(() => {})
+    },
+  })
+}
+
 async function holdThoughts(res, signal) {
   const rd = res.body.getReader()
   const dec = new TextDecoder()
@@ -1977,12 +2879,13 @@ async function holdThoughts(res, signal) {
   let done = false
   let release = false
   let bad = false
+  let timedOut = false
   let failure
   // pending is a read still out when the hold's time ran out: the body
   // takes it first, so no chunk is lost
   let pending
   let timer
-  const late = new Promise((r) => (timer = setTimeout(r, retry400.holdMs, LATE)))
+  const start = Date.now()
   // loose is the lines of a JSON value written with no "data:" before it,
   // as Code Assist writes its late error: after the thinking events, a
   // line of its own, {"error":{"code":400,…,"status":"INVALID_ARGUMENT"}}
@@ -2007,12 +2910,23 @@ async function holdThoughts(res, signal) {
     }
   }
   try {
-    while (!release && !bad) {
+    while (!release && !bad && !timedOut) {
+      const elapsed = Date.now() - start
+      const waitMs = held.length > 0 ? Math.max(0, retry400.holdMs - elapsed) : Math.max(0, timeouts.holdSilentMs - elapsed)
+      if (waitMs === 0) {
+        if (held.length > 0) release = true
+        else timedOut = true
+        break
+      }
       const read = rd.read()
+      const late = new Promise((r) => (timer = setTimeout(r, waitMs, LATE)))
       const r = await Promise.race([read, late])
+      clearTimeout(timer)
+      timer = undefined
       if (r === LATE) {
         pending = read
-        release = true
+        if (held.length > 0) release = true
+        else timedOut = true
         break
       }
       if (r.done) {
@@ -2023,18 +2937,22 @@ async function holdThoughts(res, signal) {
       size += r.value.length
       buf += dec.decode(r.value, { stream: true })
       scan(false)
-      if (size > retry400.holdMax) release = true
+      if (!bad && !release && (size > retry400.holdMax || Date.now() - start >= retry400.holdMs)) release = true
     }
-    if (done && !bad && !release) scan(true)
+    if (done && !bad && !release && !timedOut) scan(true)
   } catch (e) {
-    if (signal?.aborted) {
-      clearTimeout(timer)
-      throw e
-    }
+    clearTimeout(timer)
+    if (signal?.aborted) throw e
     failure = e
   }
   clearTimeout(timer)
+  if (timedOut) {
+    pending?.catch(() => {})
+    await rd.cancel().catch(() => {})
+    return { bad: false, timeout: true }
+  }
   if (bad) {
+    pending?.catch(() => {})
     await rd.cancel().catch(() => {})
     return { bad: true }
   }
@@ -2054,14 +2972,19 @@ async function holdThoughts(res, signal) {
         ctl.error(e)
       }
     },
-    cancel: (r) => rd.cancel(r),
+    cancel: (r) => {
+      pending?.catch(() => {})
+      return rd.cancel(r)
+    },
   })
-  return { bad: false, body }
+  return { bad: false, timeout: false, body }
 }
 
 // complete sends a Gemini request at url (…/models/<id>:<method>) to
 // Antigravity for the account s
 async function complete(s, url, init, magpie) {
+  reloadDynamicRules()
+  pruneGlobalMaps()
   void syncRemoteRulesIfNeeded(false)
   const m = /\/models\/([^/:?]+):(streamGenerateContent|generateContent|countTokens)/.exec(url)
   if (!m) return errorResponse(404, `Antigravity: no such API: ${url}`)
@@ -2072,13 +2995,14 @@ async function complete(s, url, init, magpie) {
   if (method === "countTokens") return errorResponse(404, "Antigravity doesn't count tokens")
   let effort = headerOf(init?.headers, EFFORT).toLowerCase()
   // a variant's level, where OpenCode asked for one
-  const tl = raw.generationConfig?.thinkingConfig?.thinkingLevel
-  // Gemini's own clients write it in capitals ("XHIGH")
-  if (!effort && typeof tl === "string" && LEVELS.includes(tl.toLowerCase())) effort = tl.toLowerCase()
+  const tl = normalizeThinkingLevel(raw.generationConfig?.thinkingConfig?.thinkingLevel)
+  // Gemini's own clients write it in capitals ("XHIGH") or numeric levels (100)
+  if (!effort && tl) effort = tl
   const acctCd = activeCooldown(GLOBAL_BREAKER_KEY) ?? activeCooldown(acctCooldownKey(s))
   if (acctCd) {
+    if (acctCd.status === 401 || acctCd.oauthDead) return errorResponse(401, acctCd.message, "expired")
     const res = errorResponse(acctCd.status, acctCd.message)
-    if (acctCd.status === 429 || acctCd.status === 503) res.headers.set("Retry-After", String(acctCd.retryAfterSec))
+    if (acctCd.status === 429) res.headers.set("Retry-After", String(acctCd.retryAfterSec))
     return res
   }
   let l
@@ -2088,11 +3012,12 @@ async function complete(s, url, init, magpie) {
     if (e instanceof SignedOut) return errorResponse(401, e.message, "expired")
     return errorResponse(e.status || 502, e.message ?? String(e))
   }
-  const [sent, at] = sentID(catalogOf(l.infos), model, effort)
+  const [sent, at] = sentID(catalogOf(l.infos), model, effort, l.deprecated)
   const modelCd = activeCooldown(GLOBAL_BREAKER_KEY) ?? activeCooldown(acctCooldownKey(s)) ?? activeCooldown(modelCooldownKey(s, sent))
   if (modelCd) {
+    if (modelCd.status === 401 || modelCd.oauthDead) return errorResponse(401, modelCd.message, "expired")
     const res = errorResponse(modelCd.status, modelCd.message)
-    if (modelCd.status === 429 || modelCd.status === 503) res.headers.set("Retry-After", String(modelCd.retryAfterSec))
+    if (modelCd.status === 429) res.headers.set("Retry-After", String(modelCd.retryAfterSec))
     return res
   }
   const system = systemText(raw)
@@ -2112,17 +3037,78 @@ async function complete(s, url, init, magpie) {
   }
   const stream = method === "streamGenerateContent"
   const ua = await userAgent()
-  const send = (credits) =>
-    fetch(`${DAILY}/v1internal:streamGenerateContent?alt=sse`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: "Bearer " + tok, "User-Agent": ua },
-      body: JSON.stringify(envelope(req, sent, l.project.id, credits, init?.headers, accountSalt(s))),
-      signal: init?.signal,
-    })
+  const abortCleanups = new Set()
+  const cleanupAllAborts = () => {
+    for (const fn of abortCleanups) {
+      try {
+        fn()
+      } catch {}
+    }
+    abortCleanups.clear()
+  }
+  const deadlineAt = Date.now() + 55_000
+  const send = async (credits) => {
+    const rem = deadlineAt - Date.now()
+    if (rem < 1_000) {
+      return {
+        res: errorResponse(504, "antigravity upstream total deadline exceeded"),
+        cleanup: () => {},
+      }
+    }
+    const headerTimeoutMs = Math.min(timeouts.headerMs, Math.max(3_000, rem))
+    const ctl = new AbortController()
+    let headerTimedOut = false
+    let cleaned = false
+    const onExternalAbort = () => {
+      if (!ctl.signal.aborted) ctl.abort(init?.signal?.reason)
+    }
+    const cleanup = () => {
+      if (cleaned) return
+      cleaned = true
+      abortCleanups.delete(cleanup)
+      init?.signal?.removeEventListener("abort", onExternalAbort)
+    }
+    abortCleanups.add(cleanup)
+    if (init?.signal) {
+      if (init.signal.aborted) {
+        cleanup()
+        ctl.abort(init.signal.reason)
+      } else {
+        init.signal.addEventListener("abort", onExternalAbort, { once: true })
+      }
+    }
+    const headerTimer = setTimeout(() => {
+      headerTimedOut = true
+      if (!ctl.signal.aborted) ctl.abort(new StatusError(504, "antigravity upstream header timeout"))
+    }, headerTimeoutMs)
+    try {
+      const res = await accountFetch(accountSalt(s) || s.rt, `${DAILY}/v1internal:streamGenerateContent?alt=sse`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer " + tok, "User-Agent": ua },
+        body: JSON.stringify(envelope(req, sent, l.project.id, credits, init?.headers, accountSalt(s))),
+        signal: ctl.signal,
+      })
+      clearTimeout(headerTimer)
+      return { res, cleanup }
+    } catch (e) {
+      clearTimeout(headerTimer)
+      cleanup()
+      if (headerTimedOut && !init?.signal?.aborted) {
+        return {
+          res: errorResponse(504, "antigravity upstream header timeout"),
+          cleanup: () => {},
+        }
+      }
+      throw e
+    }
+  }
   const attempt = async () => {
-    let res = await send(false)
+    let { res, cleanup } = await send(false)
     let refusal
     if (res.status === 429 && l.project.credits && usesCredits(magpie) && !allTurnsAway(shapedSystem)) {
+      if (deadlineAt - Date.now() < 5_000) {
+        return { res, refusal, cleanup }
+      }
       // the plan's quota is used up: the app asks before it spends AI
       // credits, and the switch is that answer. Credits are asked for only
       // after a refusal, so a request the plan covers never spends one.
@@ -2131,20 +3117,23 @@ async function complete(s, url, init, magpie) {
       // the refusal is what the agent is told. Its body can't be read after
       // it was cancelled ("Body already used", a 502 on every retry).
       refusal = await res.text()
+      cleanup()
       let again
       try {
         again = await send(true)
       } catch (e) {
         if (init?.signal?.aborted) throw e
       }
-      if (again?.ok) {
-        res = again
+      if (again?.res?.ok) {
+        res = again.res
+        cleanup = again.cleanup
         refusal = undefined
       } else {
-        await again?.body?.cancel().catch(() => {})
+        await again?.res?.body?.cancel().catch(() => {})
+        again?.cleanup?.()
       }
     }
-    return { res, refusal }
+    return { res, refusal, cleanup }
   }
   // Gemini 4 now and then fails a request the same request later passes:
   // its backend rejects a call the model built itself (a 400
@@ -2152,69 +3141,103 @@ async function complete(s, url, init, magpie) {
   // Such a reply is asked again, up to RETRY_BAD_CALL times. A 400 that
   // comes back fast is the request's own fault and is returned as it is.
   const again400 = isGemini4(sent) || isGemini4(model)
-  let res, refusal
+  let res, refusal, activeCleanup
   // asks is how many times the model was asked; slow, whether the last
   // 400 took long enough to be the model's own (retry400.floorMs)
   let asks = 0
   let slow = false
   let lastElapsedMs = 0
-  for (let n = 0; ; n++) {
-    const t0 = Date.now()
-    ;({ res, refusal } = await attempt())
-    lastElapsedMs = Date.now() - t0
-    asks = n + 1
-    slow = lastElapsedMs >= retry400.floorMs
-    const left = again400 && n < RETRY_BAD_CALL && !init?.signal?.aborted
-    if (!left) break
+  try {
+    for (let n = 0; ; n++) {
+      const t0 = Date.now()
+      ;({ res, refusal, cleanup: activeCleanup } = await attempt())
+      lastElapsedMs = Date.now() - t0
+      asks = n + 1
+      slow = lastElapsedMs >= retry400.floorMs
+      const left = again400 && n < RETRY_BAD_CALL && !init?.signal?.aborted
+      if (!left) break
+      if (!res.ok) {
+        if (res.status !== 400) break
+        const text = refusal ?? (await res.text())
+        activeCleanup?.()
+        refusal = text
+        if (!badCall(text) || !slow || deadlineAt - Date.now() < 5_000) break
+        await sleep(retry400.pauseMs)
+        continue
+      }
+      const held = await holdThoughts(res, init?.signal)
+      if (held.timeout) {
+        activeCleanup?.()
+        res = errorResponse(504, "antigravity upstream stream silent timeout")
+        refusal = undefined
+        break
+      }
+      if (held.bad) {
+        activeCleanup?.()
+        if (deadlineAt - Date.now() < 5_000) {
+          res = errorResponse(504, "antigravity upstream retry budget exhausted")
+          refusal = undefined
+          break
+        }
+        await sleep(retry400.pauseMs)
+        continue
+      }
+      res = new Response(held.body, { status: 200, headers: res.headers })
+      break
+    }
     if (!res.ok) {
-      if (res.status !== 400) break
       const text = refusal ?? (await res.text())
-      refusal = text
-      if (!badCall(text) || !slow) break
-      await sleep(retry400.pauseMs)
-      continue
+      activeCleanup?.()
+      const msg = apiError(text, res.status)
+      if (again400 && res.status === 400 && slow && badCall(text)) return errorResponse(400, badCallSaid(sent, asks)(msg))
+      if (res.status === 401) {
+        tokens.delete(s.rt)
+        return errorResponse(401, `Antigravity: ${msg}`, "kept")
+      }
+      if (res.status === 404) return errorResponse(404, `model ${sent} not found`)
+      if (res.status === 429 && /resource has been exhausted/i.test(text) && allTurnsAway(shapedSystem)) {
+        // the system prompt turned away, not a quota: a 400 the next member
+        // of a group is asked after, and the agent doesn't retry. It says
+        // what Antigravity answered (a 429), not that this is a channel
+        return errorResponse(400, `Antigravity answered 429 to this system prompt: ${msg} — ${hint(shapedSystem)}`)
+      }
+      if (isTransientTimeout(res.status, text)) {
+        recordTimeoutCooldown(s, sent, res.status, text)
+        return errorResponse(res.status === 502 ? 502 : 504, `Antigravity: ${msg}`)
+      }
+      let failureInfo
+      if (res.status === 403 || res.status === 429 || res.status === 503) {
+        failureInfo = recordUpstreamFailure(s, sent, res.status, res.headers, text, {
+          elapsedMs: lastElapsedMs,
+          rawSystem: system,
+          shapedSystem,
+          firstUser: firstUserText(raw),
+        })
+      }
+      if (res.status === 429 && l.project.credits && !usesCredits(magpie)) {
+        // the credits note only where the model's quota may be what ran
+        // out: a 429 with quota left is something else, and credits would
+        // not change it (plugins#1148)
+        const left = await quotaLeft(s, sent)
+        const note = left > 0 ? quotaLeftNote(left) : CREDITS_NOTE
+        return new Response(withNote(text, note), { status: 429, headers: { "content-type": "application/json" } })
+      }
+      const resHeaders = { "content-type": res.headers.get("content-type") ?? "application/json" }
+      return new Response(text, { status: res.status, headers: resHeaders })
     }
-    const held = await holdThoughts(res, init?.signal)
-    if (held.bad) {
-      await sleep(retry400.pauseMs)
-      continue
+    clearModelCooldown(s, sent)
+    const timedBody = withIdleTimeout(res.body, timeouts.streamIdleMs, activeCleanup)
+    if (stream) return new Response(unwrap(timedBody, again400 ? badCallSaid(sent, asks) : undefined), { status: 200, headers: RESPONSE_HEADERS })
+    try {
+      return new Response(JSON.stringify(await whole(new Response(timedBody, { status: 200, headers: res.headers }))), { status: 200, headers: { "content-type": "application/json" } })
+    } catch (e) {
+      if (e instanceof StatusError) return errorResponse(e.status || 504, e.message)
+      throw e
     }
-    res = new Response(held.body, { status: 200, headers: res.headers })
-    break
+  } catch (e) {
+    cleanupAllAborts()
+    throw e
   }
-  if (!res.ok) {
-    const text = refusal ?? (await res.text())
-    const msg = apiError(text, res.status)
-    if (again400 && res.status === 400 && slow && badCall(text)) return errorResponse(400, badCallSaid(sent, asks)(msg))
-    if (res.status === 401) return errorResponse(401, `Antigravity: ${msg}`, "kept")
-    if (res.status === 404) return errorResponse(404, `model ${sent} not found`)
-    if (res.status === 429 && /resource has been exhausted/i.test(text) && allTurnsAway(shapedSystem)) {
-      // the system prompt turned away, not a quota: a 400 the next member
-      // of a group is asked after, and the agent doesn't retry. It says
-      // what Antigravity answered (a 429), not that this is a channel
-      return errorResponse(400, `Antigravity answered 429 to this system prompt: ${msg} — ${hint(shapedSystem)}`)
-    }
-    if (res.status === 403 || res.status === 429 || res.status === 503) {
-      recordUpstreamFailure(s, sent, res.status, res.headers, text, {
-        elapsedMs: lastElapsedMs,
-        rawSystem: system,
-        shapedSystem,
-        firstUser: firstUserText(raw),
-      })
-    }
-    if (res.status === 429 && l.project.credits && !usesCredits(magpie)) {
-      // the credits note only where the model's quota may be what ran
-      // out: a 429 with quota left is something else, and credits would
-      // not change it (plugins#1148)
-      const left = await quotaLeft(s, sent)
-      const note = left > 0 ? quotaLeftNote(left) : CREDITS_NOTE
-      return new Response(withNote(text, note), { status: 429, headers: { "content-type": "application/json" } })
-    }
-    return new Response(text, { status: res.status, headers: { "content-type": res.headers.get("content-type") ?? "application/json" } })
-  }
-  clearModelCooldown(s, sent)
-  if (stream) return new Response(unwrap(res.body, again400 ? badCallSaid(sent, asks) : undefined), { status: 200, headers: RESPONSE_HEADERS })
-  return new Response(JSON.stringify(await whole(res)), { status: 200, headers: { "content-type": "application/json" } })
 }
 
 // ---- Google AI credits ----------------------------------------------------------------------
@@ -2276,14 +3299,25 @@ async function whole(res) {
   const out = { candidates: [] }
   const parts = []
   let last
+  let finishReason
   let groundingMetadata
-  for (const l of text.split(/\r?\n/)) {
-    if (!l.startsWith("data:")) continue
-    let j = parse(l.slice(5).trim())
-    if (isObj(j?.response)) j = j.response
-    if (!isObj(j)) continue
+  let loose = ""
+  const inspectErr = (j) => {
+    const err = isObj(j?.error) ? j.error : isObj(j?.response?.error) ? j.response.error : null
+    if (!err) return
+    const code = Number(err.code)
+    const status = Number.isInteger(code) && code >= 400 && code < 600 ? code : 502
+    throw new StatusError(status, `Antigravity: ${apiError(JSON.stringify({ error: err }), status)}`)
+  }
+  const takeChunk = (j) => {
+    if (!isObj(j)) return
+    inspectErr(j)
+    if (isObj(j.response)) j = j.response
+    if (!isObj(j)) return
+    inspectErr(j)
     last = j
     const c0 = j.candidates?.[0]
+    if (typeof c0?.finishReason === "string" && c0.finishReason) finishReason = c0.finishReason
     if (isObj(c0?.groundingMetadata)) groundingMetadata = mergeGrounding(groundingMetadata, c0.groundingMetadata)
     for (const p of c0?.content?.parts ?? []) {
       // a stream ends on an empty text, which Claude refuses sent back
@@ -2296,8 +3330,27 @@ async function whole(res) {
     if (j.modelVersion) out.modelVersion = j.modelVersion
     if (j.responseId) out.responseId = j.responseId
   }
+  for (const rawLine of text.split(/\r?\n/)) {
+    const l = rawLine.replace(/\r$/, "")
+    if (l.startsWith("data:")) {
+      loose = ""
+      takeChunk(parse(l.slice(5).trim()))
+    } else if (loose || l.trimStart().startsWith("{")) {
+      loose += l + "\n"
+      const j = parse(loose)
+      if (j !== undefined) {
+        loose = ""
+        takeChunk(j)
+      } else if (loose.length > 512 * 1024) {
+        loose = ""
+      }
+    }
+  }
+  if (!last || !finishReason) {
+    throw new StatusError(502, "Antigravity: the reply ended before it was complete")
+  }
   const c = last?.candidates?.[0] ?? {}
-  out.candidates = [{ ...c, ...(groundingMetadata ? { groundingMetadata } : {}), content: { role: "model", parts } }]
+  out.candidates = [{ ...c, finishReason, ...(groundingMetadata ? { groundingMetadata } : {}), content: { role: "model", parts } }]
   return out
 }
 
@@ -2440,10 +3493,15 @@ async function usage(auth) {
     if (e instanceof SignedOut) return { error: e.message, signIn: "expired" }
     return { error: e?.message ?? String(e), signIn: "kept" }
   }
+  const raw = catalogOf(l.infos)
+  const fams = families(raw)
+  const familyOf = (id) => fams.find((f) => f.variants.length > 1 && f.variants.some((v) => v.id === id))?.id ?? id
   const ws = []
   for (const mi of l.infos) {
     if (mi.remaining < 0) continue
     const w = { name: mi.name || mi.id, used: (1 - mi.remaining) * 100, model: mi.id, family: vendorOf(mi.id, mi.name) }
+    const fam = familyOf(mi.id)
+    w.models = fam !== mi.id ? [mi.id, fam] : [mi.id]
     if (mi.resets) {
       w.resetsAt = mi.resets
       w.resetSecs = resetSecs(mi.resets)
@@ -2466,10 +3524,15 @@ const b64url = (b) => b.toString("base64").replace(/\+/g, "-").replace(/\//g, "_
 // sign-in to keep: the account's email, its project found or set up
 async function signedIn(rt, access, expires, projectID, email) {
   const s = { rt, project: projectID ?? "", access: access ?? "", expires: expires ?? 0, who: email ?? "" }
-  if (!access) await token(s)
+  const hadDeadCd = cooldowns.delete(acctCooldownKey(s))
+  if (hadDeadCd) savePersistentCooldowns()
+  if (!access) {
+    tokens.delete(rt)
+    await token(s)
+  }
   const tok = await token(s)
   if (!email) {
-    const res = await fetch(WHO_URL, { headers: { Authorization: "Bearer " + tok }, signal: AbortSignal.timeout(30_000) })
+    const res = await accountFetch(accountSalt(s) || s.rt, WHO_URL, { headers: { Authorization: "Bearer " + tok }, signal: AbortSignal.timeout(30_000) })
     const who = res.ok ? parse(await res.text()) : undefined
     email = who?.email
     if (!email) throw new Error("Google didn't say whose account this is")
@@ -2480,6 +3543,7 @@ async function signedIn(rt, access, expires, projectID, email) {
     const p = await resolveProject(s)
     s.project = p.id
     projects.set(rt, p)
+    if (projects.size > MAX_BOUNDED_CACHE) pruneBoundedMap(projects, MAX_BOUNDED_CACHE, isProjectExpired)
   } catch (e) {
     if (e instanceof SignedOut) throw e
   }
@@ -2553,19 +3617,22 @@ async function signIn() {
     method: "auto",
     async callback() {
       let timer
+      const ephemeralPoolKey = `signin:${state}`
       try {
         const cb = await Promise.race([back, new Promise((r) => (timer = setTimeout(() => r(null), SIGN_IN_TIMEOUT)))])
         if (!cb) return { type: "failed", error: "the sign-in timed out" }
         if (cb.err) return { type: "failed", error: `Google: ${cb.err}` }
-        const t = await postForm(TOKEN_URL, { grant_type: "authorization_code", code: cb.code, redirect_uri: redirect, client_id: CLIENT_ID, client_secret: CLIENT_SECRET, code_verifier: verifier })
+        const t = await postForm(TOKEN_URL, { grant_type: "authorization_code", code: cb.code, redirect_uri: redirect, client_id: CLIENT_ID, client_secret: CLIENT_SECRET, code_verifier: verifier }, ephemeralPoolKey)
         if (!t.access_token || !t.refresh_token) return { type: "failed", error: "Google sent back no token" }
         const expires = Date.now() + (Number(t.expires_in) || 3600) * 1000
         tokens.set(t.refresh_token, { access: t.access_token, expires })
+        if (tokens.size > MAX_BOUNDED_CACHE) pruneBoundedMap(tokens, MAX_BOUNDED_CACHE, isTokenExpired)
         return await signedIn(t.refresh_token, t.access_token, expires, "")
       } catch (e) {
         return { type: "failed", error: e?.message ?? String(e) }
       } finally {
         clearTimeout(timer)
+        accountPoolManager.destroyAccount(ephemeralPoolKey)
         close()
       }
     },
@@ -2713,7 +3780,7 @@ async function webSearch({ query, count } = {}, ctx = {}) {
     throw e
   }
   const picked = pickSearchModel(l.infos)
-  const [sent, at] = sentID(catalogOf(l.infos), picked, "minimal")
+  const [sent, at] = sentID(catalogOf(l.infos), picked, "minimal", l.deprecated)
   const n = Number.isInteger(Number(count)) && Number(count) > 0 ? Math.min(Number(count), 20) : 6
   const raw = {
     systemInstruction: {
@@ -2736,7 +3803,7 @@ async function webSearch({ query, count } = {}, ctx = {}) {
     throw e
   }
   const ua = await userAgent()
-  const res = await fetch(`${DAILY}/v1internal:streamGenerateContent?alt=sse`, {
+  const res = await accountFetch(accountSalt(s) || s.rt, `${DAILY}/v1internal:streamGenerateContent?alt=sse`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: "Bearer " + tok, "User-Agent": ua },
     body: JSON.stringify(envelope(req, sent, l.project.id, false, undefined, accountSalt(s))),
@@ -2884,6 +3951,8 @@ export const _internal = {
   DEFAULT_VERSION,
   CLS,
   clOf,
+  resolveVersion,
+  effectiveCLS,
   enums,
   userAgent,
   cooldowns,
@@ -2912,4 +3981,29 @@ export const _internal = {
   REMOTE_SYNC_INTERVAL_MS,
   recordUpstreamFailure,
   isSuspectRuleBlock,
+  timeouts,
+  holdThoughts,
+  withIdleTimeout,
+  recordTimeoutCooldown,
+  isTransientTimeout,
+  sanitizeResponseValue,
+  sanitizeSchemaDescriptions,
+  AccountPoolManager,
+  accountPoolManager,
+  accountFetch,
+  streak503,
+  clearModelCooldown,
+  pruneBoundedMap,
+  pruneGlobalMaps,
+  parseDurationMs,
+  parseRetryDelayMs,
+  isQuotaExhausted429,
+  isOAuthRevokedText,
+  deprecatedModels,
+  normalizeThinkingLevel,
+  entry,
+  model,
+  token,
+  tokenInFlight,
+  signedIn,
 }

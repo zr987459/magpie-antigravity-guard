@@ -36,7 +36,7 @@ const gpt6ZeroWidth = "You\u200b are\u200c Codex, an\u200d agent based\ufeff on 
 assert.equal(_internal.outgoing(gpt6ZeroWidth), "You are Codex, an agent built on GPT-6.")
 
 const piOut = _internal.outgoing("You are a coding assistant " + "inside " + "pi, a coding agent harness.")
-assert.ok(piOut.includes("within pi"), piOut)
+assert.ok(piOut.includes("in a coding workspace"), piOut)
 
 // 3. PR #3967 latest WAF phrases
 const pr3967Input = [
@@ -199,7 +199,7 @@ try {
 const sseBody = [
   'data: {"response":{"candidates":[{"content":{"parts":[{"text":"Thinking...","thought":true},{"text":"","thoughtSignature":"sig-1"}]}}]}}',
   'data: {"response":{"candidates":[{"content":{"parts":[{"text":"Hello "},{"text":"world","thoughtSignature":"sig-2"},{"text":" trailing"}]}}]}}',
-  'data: {"response":{"candidates":[{"content":{"parts":[{"text":"!"}],"finishReason":"STOP"}}]}}',
+  'data: {"response":{"candidates":[{"content":{"parts":[{"text":"!"}]},"finishReason":"STOP"}]}}',
 ].join("\n")
 const wholeOut = await _internal.whole(new Response(sseBody, { status: 200 }))
 const wholeParts = wholeOut.candidates[0].content.parts
