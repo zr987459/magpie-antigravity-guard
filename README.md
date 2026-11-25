@@ -20,7 +20,13 @@
    - **单号 403 / TOS 429**：立即本地持久化冷却 24 小时，期间不再向 Google 发送请求。
    - **单号+模型 429 / 503**：按上游 `Retry-After` / `retryDelay` 自动本地冷却。
    - **全局连环风控刹车**：60 秒内有 ≥2 个不同账号触发风控时自动全局熔断 10 分钟；遇到疑似新规则裸 429 时立即暂停 60 秒并触发云端词库拉取，配合 Magpie 路由组无缝切走备用通道。
-4. **开箱即用 · 云端词库自动热同步**
+4. **Plan Guard（降级/免费号防送死门禁）**
+   - 自动识别 `loadCodeAssist` 与 `logins.json` 中的套餐状态：正常放行 `Google AI Pro` / `Google AI Ultra` 以及无法明确判断的 `unknown` 账号（宁放不误杀）；一旦确认为 `Antigravity Starter Quota` / `free-tier`（无 `paidTier`）等降级免费号，立即阻止向 Google 发起上游推理请求，并对其施加 6 小时单号隔离冷却（`reason: "plan_downgraded"`，返回 `429 + Retry-After` 触发 Magpie 自动切换至其他 Pro 账号或 `ai-studio`，绝不触发全局连环刹车），同时在 `rule-alerts.jsonl` 去重记录一次告警。
+   - 支持通过 `AG_PLAN_GUARD_ENABLED`、`AG_ALLOW_FREE_EMAILS`（逗号分隔白名单）、`AG_PLAN_GUARD_COOLDOWN_MS` 或 `dynamic-rules.json` 的 `planGuard` 字段热配置；当账号续费恢复 Pro/Ultra 后，支持通过低频探测（10 分钟节流）、冷却到期自动重探或重登无感自愈解除隔离。
+5. **Per-Account Rate/Hourly Soft Guard（单号滑窗软限流保护）**
+   - 仅统计各账号真实推理请求（`generateContent` / `streamGenerateContent`；`countTokens`、`models`、`usage` 不计入），默认双滑窗阈值：`200` 次/60 分钟（`AG_MAX_REQ_PER_HOUR`）与 `45` 次/5 分钟（`AG_MAX_REQ_PER_5M`）。
+   - 触发阈值时仅在内存实施 15 秒–5 分钟软退避（`429 + Retry-After`，`reason: "soft_rate_limit"`，不写 `cooldowns.json`、不写 `rule-alerts.jsonl`、不触发全局熔断），让 Magpie 平滑把流量切分至其余健康 Pro 账号。
+6. **开箱即用 · 云端词库自动热同步**
    - 无需安装额外外部脚本或 systemd 定时任务！
    - 插件启动后每 **30 分钟** 在后台非阻塞异步检查一次最新词库（5 秒超时，静默容错绝不影响正常对话），遇到疑似新风控 429 时也会立即后台拉取更新并热生效。
    - 全部状态文件均基于当前插件目录动态解析，100% 兼容 **Windows / macOS / Linux 桌面版与 Docker 版**（只读目录下也可纯内存热生效）。
@@ -70,10 +76,31 @@ magpie plugin update
 
 ---
 
+## 可选环境变量配置（Plan Guard / 软限流）
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `AG_PLAN_GUARD_ENABLED` | `true` | 是否开启降级/免费号隔离门禁（设为 `false` / `0` 关闭） |
+| `AG_ALLOW_FREE_EMAILS` | 空 | 逗号分隔免费号白名单邮箱，命中账号直接放行 |
+| `AG_PLAN_GUARD_COOLDOWN_MS` | `21600000` (6h) | 降级号单号冷却时长（毫秒） |
+| `AG_RATE_GUARD_ENABLED` | `true` | 是否开启单号滑窗软限流 |
+| `AG_MAX_REQ_PER_HOUR` | `200` | 单号 60 分钟推理请求软上限 |
+| `AG_MAX_REQ_PER_5M` | `45` | 单号 5 分钟突发推理请求软上限 |
+| `AG_RATE_COOLDOWN_MIN_MS` | `15000` | 软限流最小冷却（毫秒） |
+| `AG_RATE_COOLDOWN_MAX_MS` | `300000` | 软限流最大冷却（毫秒） |
+
+*(也支持在 `dynamic-rules.json` 的 `planGuard` 对象中热配置 `{ "enabled": true, "allowFreeEmails": [], "cooldownMs": 0 }`。)*
+
+---
+
 ## 离线测试验证
 
 ```bash
 node test/offline.test.mjs
+node test/hardening.test.mjs
+node test/plan-and-rate-guard.test.mjs
 # 或在容器内使用 magpie-bun：
 magpie-bun test/offline.test.mjs
+magpie-bun test/hardening.test.mjs
+magpie-bun test/plan-and-rate-guard.test.mjs
 ```

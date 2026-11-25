@@ -118,19 +118,106 @@ class SignedOut extends Error {}
 // ---- per-account isolated HTTP/HTTPS connection pool ----------------------------------
 
 const POOL_MAX_ACCOUNTS = 32
+const POOL_IDLE_EVICT_MS = 20_000
+const STREAM_SOCKET_TIMEOUT_MS = 135_000
 const POOL_AGENT_OPTIONS = {
   keepAlive: true,
   maxSockets: 20,
-  maxFreeSockets: 8,
-  keepAliveMsecs: 30_000,
-  timeout: 60_000,
+  maxFreeSockets: 2,
+  keepAliveMsecs: 15_000,
+  timeout: STREAM_SOCKET_TIMEOUT_MS,
 }
 
 class AccountPoolManager {
-  constructor(maxPools = POOL_MAX_ACCOUNTS, agentOptions = POOL_AGENT_OPTIONS) {
+  constructor(maxPools = POOL_MAX_ACCOUNTS, agentOptions = POOL_AGENT_OPTIONS, idleEvictMs = POOL_IDLE_EVICT_MS) {
     this.maxPools = maxPools
     this.agentOptions = agentOptions
+    this.idleEvictMs = idleEvictMs
     this.pools = new Map()
+    this.idleTimers = new WeakMap()
+  }
+
+  clearIdleTimer(sock) {
+    if (!sock) return
+    const timer = this.idleTimers.get(sock)
+    if (timer) {
+      clearTimeout(timer)
+      this.idleTimers.delete(sock)
+    }
+  }
+
+  removeFromFreeSockets(agent, sock) {
+    if (!agent?.freeSockets || !sock) return
+    for (const [name, list] of Object.entries(agent.freeSockets)) {
+      if (!Array.isArray(list)) continue
+      const idx = list.indexOf(sock)
+      if (idx >= 0) {
+        list.splice(idx, 1)
+        if (list.length === 0) delete agent.freeSockets[name]
+      }
+    }
+  }
+
+  evictIdleSockets(agent, maxAgeMs = this.idleEvictMs) {
+    if (!agent?.freeSockets) return 0
+    const now = Date.now()
+    let evicted = 0
+    for (const [name, list] of Object.entries(agent.freeSockets)) {
+      if (!Array.isArray(list)) continue
+      for (let i = list.length - 1; i >= 0; i--) {
+        const sock = list[i]
+        const freedAt = sock?.__magpieFreedAt
+        const age = typeof freedAt === "number" ? now - freedAt : Infinity
+        const stale = !sock || sock.destroyed || !sock.writable || sock.writableEnded || maxAgeMs <= 0 || age >= maxAgeMs
+        if (stale) {
+          list.splice(i, 1)
+          this.clearIdleTimer(sock)
+          if (sock && !sock.destroyed) {
+            try { sock.destroy() } catch {}
+          }
+          evicted++
+        }
+      }
+      if (list.length === 0) delete agent.freeSockets[name]
+    }
+    return evicted
+  }
+
+  installIdleEviction(agent) {
+    if (!agent || agent.__magpieIdleEvictionInstalled) return agent
+    agent.__magpieIdleEvictionInstalled = true
+
+    agent.on("free", (sock) => {
+      if (!sock || sock.destroyed || sock.writableEnded) {
+        this.clearIdleTimer(sock)
+        return
+      }
+      this.clearIdleTimer(sock)
+      sock.__magpieFreedAt = Date.now()
+      const timer = setTimeout(() => {
+        this.idleTimers.delete(sock)
+        this.removeFromFreeSockets(agent, sock)
+        if (!sock.destroyed) {
+          try { sock.destroy() } catch {}
+        }
+      }, this.idleEvictMs)
+      if (typeof timer.unref === "function") timer.unref()
+      this.idleTimers.set(sock, timer)
+      if (!sock.__magpieCloseHooked) {
+        sock.__magpieCloseHooked = true
+        sock.once("close", () => this.clearIdleTimer(sock))
+      }
+    })
+
+    if (typeof agent.reuseSocket === "function") {
+      const origReuse = agent.reuseSocket.bind(agent)
+      agent.reuseSocket = (sock, req) => {
+        this.clearIdleTimer(sock)
+        if (sock) delete sock.__magpieFreedAt
+        return origReuse(sock, req)
+      }
+    }
+    return agent
   }
 
   normalizeKey(accountKey) {
@@ -169,11 +256,21 @@ class AccountPoolManager {
   getAgent(accountKey, protocol) {
     const entry = this.getEntry(accountKey)
     if (protocol === "http:") {
-      if (!entry.httpAgent) entry.httpAgent = new http.Agent(this.agentOptions)
+      if (!entry.httpAgent) entry.httpAgent = this.installIdleEviction(new http.Agent(this.agentOptions))
+      this.evictIdleSockets(entry.httpAgent, this.idleEvictMs)
       return entry.httpAgent
     }
-    if (!entry.httpsAgent) entry.httpsAgent = new https.Agent(this.agentOptions)
+    if (!entry.httpsAgent) entry.httpsAgent = this.installIdleEviction(new https.Agent(this.agentOptions))
+    this.evictIdleSockets(entry.httpsAgent, this.idleEvictMs)
     return entry.httpsAgent
+  }
+
+  destroyAccountIdle(accountKey) {
+    const key = this.normalizeKey(accountKey)
+    const entry = this.pools.get(key)
+    if (!entry) return
+    this.evictIdleSockets(entry.httpsAgent, 0)
+    this.evictIdleSockets(entry.httpAgent, 0)
   }
 
   destroyAccount(accountKey) {
@@ -246,13 +343,15 @@ async function bodyToBuffer(body) {
   return Buffer.from(await new Response(body).arrayBuffer())
 }
 
-function accountFetchOnce(accountKey, urlObj, method, reqHeaders, bodyBuf, signal) {
+function accountFetchOnce(accountKey, urlObj, method, reqHeaders, bodyBuf, signal, opts = {}) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(toAbortError(signal.reason))
 
     const protocol = urlObj.protocol === "http:" ? "http:" : "https:"
     const transport = protocol === "http:" ? http : https
     const agent = accountPoolManager.getAgent(accountKey, protocol)
+    const streamSocketTimeoutMs = Math.max(STREAM_SOCKET_TIMEOUT_MS, timeouts.streamIdleMs + 15_000, Number(opts?.streamSocketTimeoutMs) || 0)
+    const preHeaderTimeoutMs = Number(opts?.preHeaderTimeoutMs) > 0 ? Number(opts.preHeaderTimeoutMs) : streamSocketTimeoutMs
 
     let settled = false
     let headersReceived = false
@@ -320,6 +419,8 @@ function accountFetchOnce(accountKey, urlObj, method, reqHeaders, bodyBuf, signa
       (res) => {
         resRef = res
         headersReceived = true
+        try { req.setTimeout(streamSocketTimeoutMs) } catch {}
+        try { res.socket?.setTimeout?.(streamSocketTimeoutMs) } catch {}
         if (signal?.aborted) {
           const err = toAbortError(signal.reason)
           cleanupTransport(err, true)
@@ -418,6 +519,12 @@ function accountFetchOnce(accountKey, urlObj, method, reqHeaders, bodyBuf, signa
     )
     reqRef = req
 
+    try { req.setTimeout(preHeaderTimeoutMs) } catch {}
+    req.on("socket", (sock) => {
+      accountPoolManager.clearIdleTimer(sock)
+      if (sock) delete sock.__magpieFreedAt
+    })
+
     req.on("error", (err) => {
       if (!headersReceived) {
         const finalErr = signal?.aborted ? toAbortError(signal.reason) : err
@@ -463,11 +570,16 @@ async function accountFetch(accountKey, input, init = {}) {
   if (bodyBuf !== null && !has("content-length") && !has("transfer-encoding")) {
     headers["Content-Length"] = String(bodyBuf.byteLength)
   }
+  const fetchOpts = {
+    preHeaderTimeoutMs: init?.preHeaderTimeoutMs,
+    streamSocketTimeoutMs: init?.streamSocketTimeoutMs,
+  }
   try {
-    return await accountFetchOnce(accountKey, urlObj, method, headers, bodyBuf, signal)
+    return await accountFetchOnce(accountKey, urlObj, method, headers, bodyBuf, signal, fetchOpts)
   } catch (err) {
     if (!signal?.aborted && isStaleSocketResetError(err)) {
-      return await accountFetchOnce(accountKey, urlObj, method, headers, bodyBuf, signal)
+      accountPoolManager.destroyAccountIdle(accountKey)
+      return await accountFetchOnce(accountKey, urlObj, method, headers, bodyBuf, signal, fetchOpts)
     }
     throw err
   }
@@ -619,6 +731,12 @@ function pruneGlobalMaps(force = false) {
   pruneBoundedMap(projects, MAX_BOUNDED_CACHE, isProjectExpired)
   pruneBoundedMap(lists, MAX_BOUNDED_CACHE, isListExpired)
   pruneBoundedMap(enums, MAX_BOUNDED_CACHE)
+  pruneBoundedMap(accountRateWindows, MAX_BOUNDED_CACHE, (v, t) => {
+    if (!Array.isArray(v)) return true
+    pruneRateTimestamps(v, t)
+    return v.length === 0
+  })
+  pruneBoundedMap(planDowngradeAlerts, MAX_BOUNDED_CACHE, (at, t) => !Number.isFinite(at) || t - at >= PLAN_GUARD_ALERT_DEDUP_MS)
 }
 
 async function postForm(url, form, poolKey = "") {
@@ -714,9 +832,22 @@ const DYNAMIC_RULES_PATH =
   typeof process !== "undefined" && process.env?.MAGPIE_AG_DYNAMIC_RULES_PATH
     ? path.resolve(process.env.MAGPIE_AG_DYNAMIC_RULES_PATH)
     : path.join(PLUGIN_DIR, "dynamic-rules.json")
-const RULE_ALERTS_PATH = path.join(PLUGIN_DIR, "rule-alerts.jsonl")
-const SYNC_TRIGGER_PATH = path.join(PLUGIN_DIR, "sync-trigger.flag")
-const COOLDOWNS_PATH = path.join(PLUGIN_DIR, "cooldowns.json")
+const LOGINS_PATH =
+  typeof process !== "undefined" && process.env?.MAGPIE_AG_LOGINS_PATH
+    ? path.resolve(process.env.MAGPIE_AG_LOGINS_PATH)
+    : path.resolve(PLUGIN_DIR, "..", "..", "logins.json")
+const RULE_ALERTS_PATH =
+  typeof process !== "undefined" && process.env?.MAGPIE_AG_RULE_ALERTS_PATH
+    ? path.resolve(process.env.MAGPIE_AG_RULE_ALERTS_PATH)
+    : path.join(PLUGIN_DIR, "rule-alerts.jsonl")
+const SYNC_TRIGGER_PATH =
+  typeof process !== "undefined" && process.env?.MAGPIE_AG_SYNC_TRIGGER_PATH
+    ? path.resolve(process.env.MAGPIE_AG_SYNC_TRIGGER_PATH)
+    : path.join(PLUGIN_DIR, "sync-trigger.flag")
+const COOLDOWNS_PATH =
+  typeof process !== "undefined" && process.env?.MAGPIE_AG_COOLDOWNS_PATH
+    ? path.resolve(process.env.MAGPIE_AG_COOLDOWNS_PATH)
+    : path.join(PLUGIN_DIR, "cooldowns.json")
 const DEFAULT_REMOTE_RULES_URL = "https://raw.githubusercontent.com/zr987459/magpie-antigravity-guard/main/dynamic-rules.json"
 const REMOTE_SYNC_INTERVAL_MS = 30 * 60 * 1000
 const REMOTE_SYNC_TIMEOUT_MS = 5000
@@ -764,11 +895,117 @@ const COOLDOWN_QUOTA_EXHAUSTED_FALLBACK_MS = 15 * 60 * 1000
 const COOLDOWN_DEFAULT_MS = 60 * 1000
 const COOLDOWN_MAX_MS = 24 * 60 * 60 * 1000
 const COOLDOWN_PERSIST_MIN_MS = 5 * 60 * 1000
+
+const PLAN_GUARD_DEFAULT_COOLDOWN_MS = 6 * 60 * 60 * 1000
+const PLAN_GUARD_PROBE_INTERVAL_MS = 10 * 60 * 1000
+const PLAN_GUARD_ALERT_DEDUP_MS = 6 * 60 * 60 * 1000
+const LOGINS_CHECK_INTERVAL_MS = 5 * 1000
+const RATE_WINDOW_5M_MS = 5 * 60 * 1000
+const RATE_WINDOW_1H_MS = 60 * 60 * 1000
+const DEFAULT_MAX_REQ_PER_HOUR = 200
+const DEFAULT_MAX_REQ_PER_5M = 45
+const DEFAULT_RATE_COOLDOWN_MIN_MS = 15 * 1000
+const DEFAULT_RATE_COOLDOWN_MAX_MS = 5 * 60 * 1000
+
+const accountRateWindows = new Map() // acctKey -> number[] (epoch ms timestamps)
+const planDowngradeAlerts = new Map() // acctKey -> lastAlertAt ms
+const loginsPlanCache = { checkedAt: 0, mtimeMs: -1, byEmail: new Map() }
+
+function parseBoolEnv(name) {
+  if (typeof process === "undefined" || !process.env) return undefined
+  const raw = process.env[name]
+  if (raw === undefined || raw === null) return undefined
+  const s = String(raw).trim().toLowerCase()
+  if (!s) return undefined
+  if (["false", "0", "off", "no"].includes(s)) return false
+  if (["true", "1", "on", "yes"].includes(s)) return true
+  return undefined
+}
+
+function parseNonNegIntEnv(name, fallback) {
+  if (typeof process === "undefined" || !process.env) return fallback
+  const raw = process.env[name]
+  if (raw === undefined || raw === null || String(raw).trim() === "") return fallback
+  const n = Number(String(raw).trim())
+  if (!Number.isFinite(n) || !Number.isInteger(n)) return fallback
+  return n <= 0 ? 0 : n
+}
+
+function isPlanGuardEnabled() {
+  const envVal = parseBoolEnv("AG_PLAN_GUARD_ENABLED")
+  if (envVal !== undefined) return envVal
+  if (typeof dynamicState !== "undefined" && typeof dynamicState.planGuard?.enabled === "boolean") {
+    return dynamicState.planGuard.enabled
+  }
+  return true
+}
+
+function allowedFreeEmailsSet() {
+  const set = new Set()
+  if (typeof dynamicState !== "undefined" && Array.isArray(dynamicState.planGuard?.allowFreeEmails)) {
+    for (const email of dynamicState.planGuard.allowFreeEmails) {
+      const clean = String(email ?? "").trim().toLowerCase()
+      if (clean) set.add(clean)
+    }
+  }
+  const rawEnv = typeof process !== "undefined" ? String(process.env?.AG_ALLOW_FREE_EMAILS ?? "") : ""
+  for (const part of rawEnv.split(/[\s,;]+/)) {
+    const clean = part.trim().toLowerCase()
+    if (clean) set.add(clean)
+  }
+  return set
+}
+
+function isFreeEmailWhitelisted(who) {
+  const clean = String(who ?? "").trim().toLowerCase()
+  if (!clean) return false
+  return allowedFreeEmailsSet().has(clean)
+}
+
+function planGuardCooldownMs() {
+  if (typeof process !== "undefined" && process.env?.AG_PLAN_GUARD_COOLDOWN_MS) {
+    const n = Number(String(process.env.AG_PLAN_GUARD_COOLDOWN_MS).trim())
+    if (Number.isFinite(n) && n >= 1000) return Math.min(COOLDOWN_MAX_MS, Math.floor(n))
+  }
+  const dyn = Number(dynamicState?.planGuard?.cooldownMs)
+  if (Number.isFinite(dyn) && dyn >= 1000) return Math.min(COOLDOWN_MAX_MS, Math.floor(dyn))
+  return PLAN_GUARD_DEFAULT_COOLDOWN_MS
+}
+
+function isRateGuardEnabled() {
+  const envVal = parseBoolEnv("AG_RATE_GUARD_ENABLED")
+  return envVal !== undefined ? envVal : true
+}
+
+function rateGuardLimits() {
+  const maxPerHour = parseNonNegIntEnv("AG_MAX_REQ_PER_HOUR", DEFAULT_MAX_REQ_PER_HOUR)
+  const maxPer5m = parseNonNegIntEnv("AG_MAX_REQ_PER_5M", DEFAULT_MAX_REQ_PER_5M)
+  const rawMin = parseNonNegIntEnv("AG_RATE_COOLDOWN_MIN_MS", DEFAULT_RATE_COOLDOWN_MIN_MS)
+  const minCooldownMs = Math.min(300_000, Math.max(1_000, rawMin || DEFAULT_RATE_COOLDOWN_MIN_MS))
+  const rawMax = parseNonNegIntEnv("AG_RATE_COOLDOWN_MAX_MS", DEFAULT_RATE_COOLDOWN_MAX_MS)
+  const maxCooldownMs = Math.max(minCooldownMs, Math.min(30 * 60 * 1000, rawMax || DEFAULT_RATE_COOLDOWN_MAX_MS))
+  return { maxPerHour, maxPer5m, minCooldownMs, maxCooldownMs }
+}
+
+function maskAccountId(s) {
+  const salt = accountSalt(s).slice(0, 6)
+  const who = String(s?.who ?? "").trim()
+  if (!who) return salt ? `acct#${salt}` : "acct#unknown"
+  const at = who.indexOf("@")
+  if (at > 0) {
+    const local = who.slice(0, at)
+    const domain = who.slice(at)
+    const maskedLocal = local.length <= 2 ? `${local[0]}*` : local.length <= 4 ? `${local.slice(0, 2)}***` : `${local.slice(0, 2)}***${local.slice(-1)}`
+    return salt ? `${maskedLocal}${domain}(#${salt})` : `${maskedLocal}${domain}`
+  }
+  const masked = who.length <= 4 ? `${who[0] ?? "*"}***` : `${who.slice(0, 2)}***${who.slice(-2)}`
+  return salt ? `${masked}(#${salt})` : masked
+}
 const timeouts = {
   headerMs: 32_000,
   holdSilentMs: 20_000,
-  streamIdleMs: 45_000,
-  cooldownMs: 0,
+  streamIdleMs: 120_000,
+  cooldownMs: 15_000,
   cooldown503Ms: 4_000,
   cooldown503EscalatedMs: 35_000,
   window503Ms: 30_000,
@@ -793,6 +1030,9 @@ function loadPersistentCooldowns() {
             strikes: Number(v.strikes) || 1,
             persisted: true,
             ...(v.oauthDead ? { oauthDead: true } : {}),
+            ...(typeof v.reason === "string" && v.reason ? { reason: v.reason } : {}),
+            ...(typeof v.plan === "string" && v.plan ? { plan: v.plan } : {}),
+            ...(Number.isFinite(v.lastProbeAt) ? { lastProbeAt: v.lastProbeAt } : {}),
           })
           cooldownFileWritten = true
         }
@@ -814,6 +1054,9 @@ function savePersistentCooldowns() {
           message: v.message,
           strikes: v.strikes,
           ...(v.oauthDead ? { oauthDead: true } : {}),
+          ...(typeof v.reason === "string" && v.reason ? { reason: v.reason } : {}),
+          ...(typeof v.plan === "string" && v.plan ? { plan: v.plan } : {}),
+          ...(Number.isFinite(v.lastProbeAt) ? { lastProbeAt: v.lastProbeAt } : {}),
         }
       }
     }
@@ -856,10 +1099,14 @@ function isSuspectRuleBlock(status, headers, text, elapsedMs = null) {
   return typeof elapsedMs === "number" && elapsedMs < 2500
 }
 
-function writeRuleAlert({ accounts, status, suspectRuleBlock, globalTriggered, errorText, elapsedMs, rawSystem, shapedSystem, firstUser }) {
+function writeRuleAlert({ accounts, status, suspectRuleBlock, globalTriggered, errorText, elapsedMs, rawSystem, shapedSystem, firstUser, type, reason, plan, tier }) {
   try {
     const entry = {
       ts: new Date().toISOString(),
+      ...(type ? { type } : {}),
+      ...(reason ? { reason } : {}),
+      ...(plan ? { plan } : {}),
+      ...(tier ? { tier } : {}),
       accounts,
       status,
       suspectRuleBlock: Boolean(suspectRuleBlock),
@@ -872,6 +1119,260 @@ function writeRuleAlert({ accounts, status, suspectRuleBlock, globalTriggered, e
     }
     fs.appendFileSync(RULE_ALERTS_PATH, JSON.stringify(entry) + "\n", "utf8")
   } catch {}
+}
+
+const PAID_PLAN_RE = /\b(?:pro|ultra|enterprise|team|business)\b|g1[-_]?(?:pro|ultra)/i
+const FREE_PLAN_RE = /\b(?:starter|free)\b/i
+const FREE_TIER_ID_RE = /^(?:free|starter|standard)(?:-tier)?$/i
+
+function readLoginsPlan(who, force = false) {
+  const whoNorm = String(who ?? "").trim().toLowerCase()
+  if (!whoNorm) return ""
+  const now = Date.now()
+  if (force || now - loginsPlanCache.checkedAt >= LOGINS_CHECK_INTERVAL_MS) {
+    loginsPlanCache.checkedAt = now
+    try {
+      const st = fs.statSync(LOGINS_PATH)
+      if (force || st.mtimeMs !== loginsPlanCache.mtimeMs) {
+        const list = JSON.parse(fs.readFileSync(LOGINS_PATH, "utf8"))
+        const next = new Map()
+        if (Array.isArray(list)) {
+          for (const item of list) {
+            if (!isObj(item)) continue
+            const agent = String(item.agent ?? "").trim().toLowerCase()
+            if (agent && !agent.startsWith(`plugin:${PROVIDER}`)) continue
+            const user = String(item.user ?? "").trim().toLowerCase()
+            const plan = String(item.plan ?? "").trim()
+            if (user && plan) next.set(user, plan)
+          }
+        }
+        loginsPlanCache.byEmail = next
+        loginsPlanCache.mtimeMs = st.mtimeMs
+      }
+    } catch {
+      if (!fs.existsSync(LOGINS_PATH)) {
+        loginsPlanCache.byEmail = new Map()
+        loginsPlanCache.mtimeMs = -1
+      }
+    }
+  }
+  return loginsPlanCache.byEmail.get(whoNorm) ?? ""
+}
+
+function classifyAccountPlan({ plan = "", tier = "", paid = "", loginsPlan = "" } = {}) {
+  const paidStr = String(paid ?? "").trim()
+  const tierStr = String(tier ?? "").trim()
+  const livePlanStr = String(plan ?? "").trim()
+  const loginsPlanStr = String(loginsPlan ?? "").trim()
+
+  if (paidStr || tierStr || livePlanStr) {
+    if (paidStr && (PAID_PLAN_RE.test(paidStr) || (!FREE_TIER_ID_RE.test(paidStr) && !/\blegacy\b/i.test(paidStr)))) {
+      return { status: "paid", source: "loadCodeAssist:paidTier", plan: livePlanStr || paidStr, tier: tierStr, paid: paidStr }
+    }
+    if (livePlanStr && PAID_PLAN_RE.test(livePlanStr)) {
+      return { status: "paid", source: "loadCodeAssist:plan", plan: livePlanStr, tier: tierStr, paid: paidStr }
+    }
+    if (livePlanStr && FREE_PLAN_RE.test(livePlanStr)) {
+      return { status: "free", source: "loadCodeAssist:plan", plan: livePlanStr, tier: tierStr, paid: paidStr }
+    }
+    if (!paidStr && tierStr && FREE_TIER_ID_RE.test(tierStr)) {
+      return { status: "free", source: "loadCodeAssist:tier", plan: livePlanStr || tierStr, tier: tierStr, paid: paidStr }
+    }
+  }
+
+  if (loginsPlanStr) {
+    if (PAID_PLAN_RE.test(loginsPlanStr)) {
+      return { status: "paid", source: "logins.json", plan: loginsPlanStr, tier: tierStr, paid: paidStr }
+    }
+    if (FREE_PLAN_RE.test(loginsPlanStr)) {
+      return { status: "free", source: "logins.json", plan: loginsPlanStr, tier: tierStr, paid: paidStr }
+    }
+  }
+
+  return { status: "unknown", source: "none", plan: livePlanStr || loginsPlanStr, tier: tierStr, paid: paidStr }
+}
+
+function recordPlanDowngradeCooldown(s, cls) {
+  if (!s?.rt) return null
+  const now = Date.now()
+  const key = acctCooldownKey(s)
+  const existing = cooldowns.get(key)
+  // Never downgrade an existing stronger 403/401/oauthDead block into a shorter plan_downgraded block
+  if (existing && existing.until > now && (existing.status === 403 || existing.status === 401 || existing.oauthDead)) {
+    return existing
+  }
+  const ms = planGuardCooldownMs()
+  const masked = maskAccountId(s)
+  const label = cls?.plan || cls?.tier || "Starter/Free"
+  const message = `Antigravity: account ${masked} is on free/downgraded plan (${label}); blocked locally for ${Math.ceil(ms / 3600_000 * 10) / 10}h to protect account`
+  const entry = {
+    until: now + ms,
+    status: 429,
+    reason: "plan_downgraded",
+    plan: label,
+    lastProbeAt: existing?.reason === "plan_downgraded" && Number.isFinite(existing.lastProbeAt) ? existing.lastProbeAt : now,
+    message,
+    strikes: (existing?.strikes ?? 0) + 1,
+    persisted: true,
+  }
+  cooldowns.set(key, entry)
+  savePersistentCooldowns()
+
+  const alertKey = accountSalt(s) || s.who || s.rt
+  const lastAlert = planDowngradeAlerts.get(alertKey)
+  if (!lastAlert || now - lastAlert >= PLAN_GUARD_ALERT_DEDUP_MS) {
+    planDowngradeAlerts.set(alertKey, now)
+    console.warn(`[antigravity] plan-guard blocked account=${masked} plan="${label}" tier="${cls?.tier || ""}" source=${cls?.source || "unknown"} cooldown=${Math.ceil(ms / 1000)}s`)
+    writeRuleAlert({
+      type: "plan_downgraded",
+      reason: "plan_downgraded",
+      plan: label,
+      tier: cls?.tier || undefined,
+      accounts: [s.who || masked],
+      status: 429,
+      suspectRuleBlock: false,
+      globalBreakerTriggered: false,
+      errorText: message,
+    })
+  }
+  return { ...entry, retryAfterSec: Math.max(1, Math.ceil(ms / 1000)) }
+}
+
+function clearPlanDowngradeCooldown(s, reasonNote = "") {
+  if (!s?.rt) return false
+  const key = acctCooldownKey(s)
+  const cur = cooldowns.get(key)
+  if (!cur || cur.reason !== "plan_downgraded") return false
+  cooldowns.delete(key)
+  savePersistentCooldowns()
+  const alertKey = accountSalt(s) || s.who || s.rt
+  planDowngradeAlerts.delete(alertKey)
+  if (reasonNote) {
+    console.info(`[antigravity] plan-guard cleared cooldown for account=${maskAccountId(s)}: ${reasonNote}`)
+  }
+  return true
+}
+
+function evaluatePlanGuard(s, projectInfo = null, forceLogins = false) {
+  if (!s?.rt) return { blocked: false, classification: { status: "unknown", source: "none" } }
+  if (!isPlanGuardEnabled()) {
+    clearPlanDowngradeCooldown(s, "plan guard disabled")
+    return { blocked: false, classification: { status: "bypassed", source: "disabled" } }
+  }
+  if (isFreeEmailWhitelisted(s.who)) {
+    clearPlanDowngradeCooldown(s, "whitelisted email")
+    return { blocked: false, classification: { status: "bypassed", source: "whitelist" } }
+  }
+  const loginsPlan = readLoginsPlan(s.who, forceLogins)
+  const cls = classifyAccountPlan({
+    plan: projectInfo?.plan,
+    tier: projectInfo?.tier,
+    paid: projectInfo?.paid,
+    loginsPlan,
+  })
+  if (cls.status === "free") {
+    const cd = recordPlanDowngradeCooldown(s, cls)
+    return {
+      blocked: true,
+      classification: cls,
+      cooldown: cd ? { ...cd, retryAfterSec: Math.max(1, Math.ceil((cd.until - Date.now()) / 1000)) } : null,
+    }
+  }
+  if (cls.status === "paid") {
+    clearPlanDowngradeCooldown(s, `active paid plan (${cls.plan || cls.paid})`)
+  }
+  return { blocked: false, classification: cls }
+}
+
+function pruneRateTimestamps(arr, now) {
+  const cutoff = now - RATE_WINDOW_1H_MS
+  let idx = 0
+  while (idx < arr.length && arr[idx] <= cutoff) idx++
+  if (idx > 0) arr.splice(0, idx)
+  return arr
+}
+
+function checkAndConsumeAccountRateLimit(s, now = Date.now()) {
+  if (!s?.rt || !isRateGuardEnabled()) return { limited: false }
+  const { maxPerHour, maxPer5m, minCooldownMs, maxCooldownMs } = rateGuardLimits()
+  if (maxPerHour <= 0 && maxPer5m <= 0) return { limited: false }
+
+  const key = accountSalt(s) || s.rt
+  let arr = accountRateWindows.get(key)
+  if (!arr) {
+    arr = []
+    accountRateWindows.set(key, arr)
+  } else {
+    accountRateWindows.delete(key)
+    accountRateWindows.set(key, arr)
+  }
+  pruneRateTimestamps(arr, now)
+  if (accountRateWindows.size > MAX_BOUNDED_CACHE) {
+    pruneBoundedMap(accountRateWindows, MAX_BOUNDED_CACHE, (v, t) => {
+      if (!Array.isArray(v)) return true
+      pruneRateTimestamps(v, t)
+      return v.length === 0
+    })
+  }
+
+  const count1h = arr.length
+  const cutoff5m = now - RATE_WINDOW_5M_MS
+  let first5mIdx = arr.length
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (arr[i] <= cutoff5m) break
+    first5mIdx = i
+  }
+  const count5m = arr.length - first5mIdx
+
+  const hit5m = maxPer5m > 0 && count5m >= maxPer5m
+  const hit1h = maxPerHour > 0 && count1h >= maxPerHour
+  if (!hit5m && !hit1h) {
+    arr.push(now)
+    return { limited: false, count1h: count1h + 1, count5m: count5m + 1 }
+  }
+
+  let wait5m = 0
+  if (hit5m && first5mIdx < arr.length) {
+    wait5m = arr[first5mIdx] + RATE_WINDOW_5M_MS - now
+  }
+  let wait1h = 0
+  if (hit1h && arr.length > 0) {
+    wait1h = arr[0] + RATE_WINDOW_1H_MS - now
+  }
+  const rawWait = Math.max(wait5m, wait1h)
+  const cooldownMs = Math.min(maxCooldownMs, Math.max(minCooldownMs, rawWait))
+  const retryAfterSec = Math.max(1, Math.ceil(cooldownMs / 1000))
+  const masked = maskAccountId(s)
+  const parts = []
+  if (hit5m) parts.push(`5m=${count5m}/${maxPer5m}`)
+  if (hit1h) parts.push(`1h=${count1h}/${maxPerHour}`)
+  const summary = parts.join(", ")
+  const message = `Antigravity: local soft rate limit reached for ${masked} (${summary}); yielding for ${retryAfterSec}s`
+
+  const acctKey = acctCooldownKey(s)
+  const prev = cooldowns.get(acctKey)
+  if (!prev || !prev.persisted || prev.until <= now) {
+    cooldowns.set(acctKey, {
+      until: now + cooldownMs,
+      status: 429,
+      reason: "soft_rate_limit",
+      message,
+      strikes: (prev?.strikes ?? 0) + 1,
+      persisted: false,
+    })
+    if (cooldowns.size > MAX_COOLDOWN_CACHE) pruneBoundedMap(cooldowns, MAX_COOLDOWN_CACHE, isCooldownExpired)
+  }
+  console.warn(`[antigravity] soft-rate-guard yield: account=${masked} ${summary} cooldown=${retryAfterSec}s`)
+  return {
+    limited: true,
+    retryAfterSec,
+    cooldownMs,
+    count1h,
+    count5m,
+    maxPerHour,
+    maxPer5m,
+    message,
+  }
 }
 
 function writeSyncTrigger(reason) {
@@ -921,6 +1422,11 @@ function activeCooldown(key) {
   const rem = entry.until - now
   if (rem <= 0) {
     cooldowns.delete(key)
+    if (entry.reason === "plan_downgraded" && key.startsWith("acct:")) {
+      const rt = key.slice(5)
+      projects.delete(rt)
+      lists.delete(rt)
+    }
     if (entry.persisted) savePersistentCooldowns()
     return null
   }
@@ -1091,6 +1597,8 @@ const isTransientTimeout = (status, text) =>
 // Lightweight short cooldown for transient 504/502/timeout failures:
 // NEVER triggers 24h 403 account ban, NEVER feeds global:breaker, NEVER writes rule-alerts.jsonl.
 function recordTimeoutCooldown(s, model, status, text) {
+  const poolKey = s ? (accountSalt(s) || s.rt) : ""
+  if (poolKey) accountPoolManager.destroyAccountIdle(poolKey)
   if (!model || !(timeouts.cooldownMs > 0)) return
   const key = modelCooldownKey(s, model)
   const prev = cooldowns.get(key)
@@ -1103,14 +1611,21 @@ function recordTimeoutCooldown(s, model, status, text) {
     strikes: (prev?.strikes ?? 0) + 1,
     persisted: false,
   })
+  if (cooldowns.size > MAX_COOLDOWN_CACHE) pruneBoundedMap(cooldowns, MAX_COOLDOWN_CACHE, isCooldownExpired)
 }
 
 // call is one of Code Assist's methods, its reply's JSON
-async function call(s, base, method, body, headers = {}, signal) {
-  const cd = activeCooldown(GLOBAL_BREAKER_KEY) ?? activeCooldown(acctCooldownKey(s))
-  if (cd) {
-    if (cd.status === 401 || cd.oauthDead) throw new SignedOut(cd.message)
-    throw new StatusError(cd.status, cd.message)
+async function call(s, base, method, body, headers = {}, signal, opts = {}) {
+  const globalCd = activeCooldown(GLOBAL_BREAKER_KEY)
+  if (globalCd) throw new StatusError(globalCd.status, globalCd.message)
+  const acctCd = activeCooldown(acctCooldownKey(s))
+  if (acctCd) {
+    const isPlanProbe = acctCd.reason === "plan_downgraded" && opts?.allowDuringPlanCooldown === true && method === "loadCodeAssist"
+    const isSoftRateMgmt = acctCd.reason === "soft_rate_limit" && (method === "loadCodeAssist" || method === "fetchAvailableModels" || method === "retrieveUserQuotaSummary")
+    if (!isPlanProbe && !isSoftRateMgmt) {
+      if (acctCd.status === 401 || acctCd.oauthDead) throw new SignedOut(acctCd.message)
+      throw new StatusError(acctCd.status, acctCd.message)
+    }
   }
   const tok = await token(s)
   const res = await accountFetch(accountSalt(s) || s.rt, `${base}/v1internal:${method}`, {
@@ -1179,10 +1694,10 @@ const LOAD_BODY = { metadata: { ideType: "ANTIGRAVITY" } }
 
 // resolveProject finds the project the account is served under, setting
 // the account up when Code Assist has none for it
-async function resolveProject(s) {
+async function resolveProject(s, opts = {}) {
   let load, err
   try {
-    load = await call(s, PROD, "loadCodeAssist", LOAD_BODY)
+    load = await call(s, PROD, "loadCodeAssist", LOAD_BODY, {}, undefined, opts)
   } catch (e) {
     err = e
   }
@@ -1190,11 +1705,17 @@ async function resolveProject(s) {
   const { tier, paid, credits } = tiersOf(load)
   if (s.project) {
     if (err) return { id: s.project, plan: "", tier: "", paid: "", credits: false, at: Date.now() }
-    return { id: s.project, plan: planOf(load), tier, paid, credits, at: Date.now() }
+    const p = { id: s.project, plan: planOf(load), tier, paid, credits, at: Date.now() }
+    evaluatePlanGuard(s, p)
+    return p
   }
   if (err) throw err
   const own = companion(load.cloudaicompanionProject)
-  if (own) return { id: own, plan: planOf(load), tier, paid, credits, at: Date.now() }
+  if (own) {
+    const p = { id: own, plan: planOf(load), tier, paid, credits, at: Date.now() }
+    evaluatePlanGuard(s, p)
+    return p
+  }
   const t = { ...defaultTier(load) }
   if (!t.id || t.id === "legacy-tier") t.id = "free-tier"
   // as the app's language server asks it: camelCase, the IDE type only,
@@ -1204,27 +1725,29 @@ async function resolveProject(s) {
     const why = (load.ineligibleTiers ?? []).find((x) => x?.reasonMessage)?.reasonMessage
     throw new Error(why ? "Antigravity won't serve this Google account: " + why : "Antigravity hasn't set this Google account up (it gave no project); sign in to the Antigravity app with it once, then try again")
   }
-  return { id, plan: t.name ?? "", tier: t.id, paid, credits, at: Date.now() }
+  const p = { id, plan: t.name ?? "", tier: t.id, paid, credits, at: Date.now() }
+  evaluatePlanGuard(s, p)
+  return p
 }
 
-async function project(s) {
+async function project(s, forceRefresh = false, opts = {}) {
   let p = projects.get(s.rt)
   if (!p) {
-    p = await resolveProject(s)
+    p = await resolveProject(s, opts)
     projects.set(s.rt, p)
     if (projects.size > MAX_BOUNDED_CACHE) pruneBoundedMap(projects, MAX_BOUNDED_CACHE, isProjectExpired)
     return p
   }
-  if (Date.now() - p.at < TIERS_TTL) return p
-  // the tiers, read again every hour: a plan bought or lapsed since
+  const ttl = opts?.bypassTtl ? 0 : forceRefresh ? 60_000 : TIERS_TTL
+  if (ttl > 0 && Date.now() - p.at < ttl) return p
+  // the tiers, read again every hour (or after 60s when explicitly refreshed): a plan bought or lapsed since
   try {
-    const load = await call(s, PROD, "loadCodeAssist", LOAD_BODY)
+    const load = await call(s, PROD, "loadCodeAssist", LOAD_BODY, {}, undefined, opts)
     const { tier, paid, credits } = tiersOf(load)
     if (tier || paid) {
-      p = { ...p, tier, paid, credits }
-      const pl = planOf(load)
-      if (pl) p.plan = pl
+      p = { ...p, tier, paid, credits, plan: planOf(load) }
     }
+    evaluatePlanGuard(s, p)
   } catch (e) {
     if (e instanceof SignedOut) throw e
   }
@@ -1282,20 +1805,30 @@ const EFFORT_WORDS = [
 
 const validPosInt = (v) => (typeof v === "number" && Number.isInteger(v) && Number.isFinite(v) && v > 0 ? v : 0)
 
+const NUMERIC_THINKING_LEVELS = {
+  1: "low",
+  2: "medium",
+  3: "high",
+  4: "minimal",
+  100: "xhigh",
+}
+
 function normalizeThinkingLevel(val) {
   if (typeof val === "string") {
-    const k = val.trim().toLowerCase().replace(/[_\s]+/g, "-")
+    const k = val
+      .trim()
+      .toLowerCase()
+      .replace(/^thinking[-_\s]+level[-_\s]+/, "")
+      .replace(/[_\s]+/g, "-")
     if (k === "extra-high" || k === "x-high") return "xhigh"
     if (k === "extra-low" || k === "x-low") return "minimal"
+    if (k === "unspecified") return ""
     return LEVELS.includes(k) ? k : ""
   }
   if (typeof val === "number" && Number.isFinite(val)) {
-    if (val <= 0) return "none"
-    if (val < 20) return "minimal"
-    if (val < 40) return "low"
-    if (val < 65) return "medium"
-    if (val < 90) return "high"
-    return "xhigh"
+    if (val <= 0) return ""
+    if (Number.isInteger(val) && val in NUMERIC_THINKING_LEVELS) return NUMERIC_THINKING_LEVELS[val]
+    return ""
   }
   return ""
 }
@@ -1429,7 +1962,7 @@ function families(raw) {
   for (const f of out) {
     const named = []
     for (const v of f.variants) {
-      const l = v.thinkingLevel || nameEffort(v.name)[1]
+      const l = normalizeThinkingLevel(v.thinkingLevel) || nameEffort(v.name)[1]
       if (l && !named.includes(l)) named.push(l)
     }
     for (const v of f.variants) {
@@ -1542,7 +2075,10 @@ function sentID(raw, model, effort, deprecated) {
     if (singleFam) {
       const idx = singleFam.variants.findIndex((v) => v.id === model)
       const vi = idx >= 0 ? idx : 0
-      return [singleFam.variants[vi].id, singleFam.efforts[vi] || singleFam.variants[vi].thinkingLevel || ""]
+      const vid = singleFam.variants[vi].id
+      const [, idEffort] = splitID(vid)
+      const defaultEffort = singleFam.efforts[vi] || normalizeThinkingLevel(singleFam.variants[vi].thinkingLevel) || ""
+      return [vid, effort ? (idEffort || "") : defaultEffort]
     }
     return [model, ""]
   }
@@ -1560,8 +2096,8 @@ const lists = new Map() // refresh token → {at, infos, project, deprecated}
 // modelInfo reads the account's models, naming its tiers as the app does
 async function modelInfo(s, fresh = false) {
   const l = lists.get(s.rt)
-  if (l && !fresh && Date.now() - l.at < MODELS_TTL) return l
-  const p = await project(s)
+  if (l && !fresh && Date.now() - l.at < MODELS_TTL && projects.has(s.rt)) return l
+  const p = await project(s, fresh)
   let res, err
   for (const t of askTiers(s, p)) {
     const body = { project: p.id }
@@ -2025,6 +2561,24 @@ const DYNAMIC_RULE_CHECK_INTERVAL_MS = 2000
 const DEFAULT_SYSTEM_TAG = "external_system_instructions"
 const VALID_SYSTEM_TAG_RE = /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/
 
+const DEFAULT_PLAN_GUARD_CFG = {
+  enabled: true,
+  allowFreeEmails: [],
+  cooldownMs: 0,
+}
+
+function sanitizePlanGuardCfg(rawCfg) {
+  if (!isObj(rawCfg)) return { ...DEFAULT_PLAN_GUARD_CFG }
+  const enabled = typeof rawCfg.enabled === "boolean" ? rawCfg.enabled : true
+  const allowFreeEmails = Array.isArray(rawCfg.allowFreeEmails)
+    ? rawCfg.allowFreeEmails.map((x) => String(x ?? "").trim().toLowerCase()).filter(Boolean)
+    : []
+  const cooldownMs = Number.isFinite(Number(rawCfg.cooldownMs)) && Number(rawCfg.cooldownMs) >= 1000
+    ? Math.min(COOLDOWN_MAX_MS, Math.floor(Number(rawCfg.cooldownMs)))
+    : 0
+  return { enabled, allowFreeEmails, cooldownMs }
+}
+
 const dynamicState = {
   checkedAt: 0,
   mtimeMs: -1,
@@ -2035,6 +2589,7 @@ const dynamicState = {
   cls: { ...CLS },
   defaultVersion: DEFAULT_VERSION,
   resolvedVersion: DEFAULT_VERSION,
+  planGuard: { ...DEFAULT_PLAN_GUARD_CFG },
 }
 
 const POISON_VALUE_RE = /you['’]?re\s+claude\s+code|\b(?:inside|within)\s+pi(?:-bolt)?\b/i
@@ -2124,6 +2679,7 @@ function applyDynamicRulesData(data, mtimeMs = dynamicState.mtimeMs) {
   dynamicState.rules = [...rulesByPhrase.values()].sort((a, b) => b.phrase.length - a.phrase.length)
   dynamicState.reworded = reworded
   dynamicState.userTurnedAway = uta
+  dynamicState.planGuard = sanitizePlanGuardCfg(data?.planGuard)
   dynamicState.mtimeMs = mtimeMs
   dynamicState.checkedAt = Date.now()
   return true
@@ -2146,6 +2702,7 @@ function reloadDynamicRules(force = false) {
       dynamicState.cls = { ...CLS }
       dynamicState.defaultVersion = DEFAULT_VERSION
       dynamicState.resolvedVersion = resolveVersion(ver.v || DEFAULT_VERSION, dynamicState.cls)
+      dynamicState.planGuard = { ...DEFAULT_PLAN_GUARD_CFG }
     }
     return
   }
@@ -2206,11 +2763,17 @@ function mergeRemoteRulesDoc(local, remote) {
   const localTag = typeof local?.systemTag === "string" ? local.systemTag.trim() : ""
   const remoteTag = typeof remote?.systemTag === "string" ? remote.systemTag.trim() : ""
   const systemTag = VALID_SYSTEM_TAG_RE.test(localTag) ? localTag : VALID_SYSTEM_TAG_RE.test(remoteTag) ? remoteTag : DEFAULT_SYSTEM_TAG
+  const mergedPlanGuard = isObj(local?.planGuard)
+    ? sanitizePlanGuardCfg(local.planGuard)
+    : isObj(remote?.planGuard)
+      ? sanitizePlanGuardCfg(remote.planGuard)
+      : undefined
   return {
     version: Number(remote?.version) || Number(local?.version) || 1,
     updatedAt: typeof remote?.updatedAt === "string" && remote.updatedAt ? remote.updatedAt : new Date().toISOString(),
     systemTag,
     clientMeta: mergedMeta,
+    ...(mergedPlanGuard ? { planGuard: mergedPlanGuard } : {}),
     ...(isObj(remote?.upstream) ? { upstream: remote.upstream } : isObj(local?.upstream) ? { upstream: local.upstream } : {}),
     saidAs: Object.fromEntries(Object.entries(cleanSaidAs).sort(([a], [b]) => a.localeCompare(b))),
     reworded: [...rewordMap.entries()],
@@ -2812,7 +3375,7 @@ function showsAnswer(j) {
 // ({bad: true}). Once an answer has begun the client has it, and the
 // stream goes through as it is: a reply can't be taken back.
 const LATE = Symbol("late")
-function withIdleTimeout(body, idleMs = timeouts.streamIdleMs, onFinalize) {
+function withIdleTimeout(body, idleMs = timeouts.streamIdleMs, onFinalize, onTimeout) {
   if (!body) {
     onFinalize?.()
     return body
@@ -2842,6 +3405,7 @@ function withIdleTimeout(body, idleMs = timeouts.streamIdleMs, onFinalize) {
           activeRead?.catch(() => {})
           activeRead = null
           const err = new StatusError(504, "antigravity upstream stream idle timeout")
+          try { onTimeout?.(err) } catch {}
           await rd.cancel(err).catch(() => {})
           finish()
           ctl.error(err)
@@ -3000,17 +3564,50 @@ async function complete(s, url, init, magpie) {
   if (!effort && tl) effort = tl
   const acctCd = activeCooldown(GLOBAL_BREAKER_KEY) ?? activeCooldown(acctCooldownKey(s))
   if (acctCd) {
-    if (acctCd.status === 401 || acctCd.oauthDead) return errorResponse(401, acctCd.message, "expired")
-    const res = errorResponse(acctCd.status, acctCd.message)
-    if (acctCd.status === 429) res.headers.set("Retry-After", String(acctCd.retryAfterSec))
-    return res
+    if (acctCd.reason === "plan_downgraded" && (!isPlanGuardEnabled() || isFreeEmailWhitelisted(s.who))) {
+      clearPlanDowngradeCooldown(s, "whitelisted/disabled")
+    } else {
+      if (acctCd.status === 401 || acctCd.oauthDead) return errorResponse(401, acctCd.message, "expired")
+      const res = errorResponse(acctCd.status, acctCd.message)
+      if (acctCd.status === 429) res.headers.set("Retry-After", String(acctCd.retryAfterSec))
+      return res
+    }
+  }
+  const cachedProj = projects.get(s.rt)
+  if (cachedProj && Date.now() - cachedProj.at < TIERS_TTL) {
+    const preGuard = evaluatePlanGuard(s, cachedProj)
+    if (preGuard.blocked) {
+      const res = errorResponse(429, preGuard.cooldown?.message || "Antigravity: account downgraded to free plan")
+      res.headers.set("Retry-After", String(preGuard.cooldown?.retryAfterSec ?? Math.ceil(planGuardCooldownMs() / 1000)))
+      return res
+    }
   }
   let l
   try {
     l = await modelInfo(s)
   } catch (e) {
     if (e instanceof SignedOut) return errorResponse(401, e.message, "expired")
+    const cdAfter = activeCooldown(acctCooldownKey(s))
+    if (cdAfter?.reason === "plan_downgraded") {
+      const res = errorResponse(429, cdAfter.message)
+      res.headers.set("Retry-After", String(cdAfter.retryAfterSec))
+      return res
+    }
+    if (isPlanGuardEnabled() && !isFreeEmailWhitelisted(s.who)) {
+      const fallbackGuard = evaluatePlanGuard(s, null)
+      if (fallbackGuard.blocked) {
+        const res = errorResponse(429, fallbackGuard.cooldown?.message || "Antigravity: account downgraded to free plan")
+        res.headers.set("Retry-After", String(fallbackGuard.cooldown?.retryAfterSec ?? Math.ceil(planGuardCooldownMs() / 1000)))
+        return res
+      }
+    }
     return errorResponse(e.status || 502, e.message ?? String(e))
+  }
+  const planGuard = evaluatePlanGuard(s, l.project)
+  if (planGuard.blocked) {
+    const res = errorResponse(429, planGuard.cooldown?.message || "Antigravity: account downgraded to free plan")
+    res.headers.set("Retry-After", String(planGuard.cooldown?.retryAfterSec ?? Math.ceil(planGuardCooldownMs() / 1000)))
+    return res
   }
   const [sent, at] = sentID(catalogOf(l.infos), model, effort, l.deprecated)
   const modelCd = activeCooldown(GLOBAL_BREAKER_KEY) ?? activeCooldown(acctCooldownKey(s)) ?? activeCooldown(modelCooldownKey(s, sent))
@@ -3018,6 +3615,12 @@ async function complete(s, url, init, magpie) {
     if (modelCd.status === 401 || modelCd.oauthDead) return errorResponse(401, modelCd.message, "expired")
     const res = errorResponse(modelCd.status, modelCd.message)
     if (modelCd.status === 429) res.headers.set("Retry-After", String(modelCd.retryAfterSec))
+    return res
+  }
+  const rateLimit = checkAndConsumeAccountRateLimit(s)
+  if (rateLimit.limited) {
+    const res = errorResponse(429, rateLimit.message)
+    res.headers.set("Retry-After", String(rateLimit.retryAfterSec))
     return res
   }
   const system = systemText(raw)
@@ -3082,20 +3685,23 @@ async function complete(s, url, init, magpie) {
       if (!ctl.signal.aborted) ctl.abort(new StatusError(504, "antigravity upstream header timeout"))
     }, headerTimeoutMs)
     try {
+      const streamSocketTimeoutMs = Math.max(STREAM_SOCKET_TIMEOUT_MS, timeouts.streamIdleMs + 15_000)
       const res = await accountFetch(accountSalt(s) || s.rt, `${DAILY}/v1internal:streamGenerateContent?alt=sse`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: "Bearer " + tok, "User-Agent": ua },
         body: JSON.stringify(envelope(req, sent, l.project.id, credits, init?.headers, accountSalt(s))),
         signal: ctl.signal,
+        preHeaderTimeoutMs: Math.min(streamSocketTimeoutMs, headerTimeoutMs + 3_000),
+        streamSocketTimeoutMs,
       })
       clearTimeout(headerTimer)
       return { res, cleanup }
     } catch (e) {
       clearTimeout(headerTimer)
       cleanup()
-      if (headerTimedOut && !init?.signal?.aborted) {
+      if ((headerTimedOut || e?.code === "ETIMEDOUT") && !init?.signal?.aborted) {
         return {
-          res: errorResponse(504, "antigravity upstream header timeout"),
+          res: errorResponse(504, headerTimedOut ? "antigravity upstream header timeout" : (e?.message || "antigravity upstream socket timeout")),
           cleanup: () => {},
         }
       }
@@ -3226,7 +3832,9 @@ async function complete(s, url, init, magpie) {
       return new Response(text, { status: res.status, headers: resHeaders })
     }
     clearModelCooldown(s, sent)
-    const timedBody = withIdleTimeout(res.body, timeouts.streamIdleMs, activeCleanup)
+    const timedBody = withIdleTimeout(res.body, timeouts.streamIdleMs, activeCleanup, (err) => {
+      recordTimeoutCooldown(s, sent, 504, err?.message ?? "antigravity upstream stream idle timeout")
+    })
     if (stream) return new Response(unwrap(timedBody, again400 ? badCallSaid(sent, asks) : undefined), { status: 200, headers: RESPONSE_HEADERS })
     try {
       return new Response(JSON.stringify(await whole(new Response(timedBody, { status: 200, headers: res.headers }))), { status: 200, headers: { "content-type": "application/json" } })
@@ -3484,13 +4092,44 @@ function pools(summary, ws) {
 }
 
 async function usage(auth) {
+  reloadDynamicRules()
   const s = stateOf(auth)
   if (!s) return { error: "no such Antigravity account", signIn: "kept" }
+  const acctCd = activeCooldown(acctCooldownKey(s))
+  if (acctCd?.reason === "plan_downgraded") {
+    if (!isPlanGuardEnabled() || isFreeEmailWhitelisted(s.who)) {
+      clearPlanDowngradeCooldown(s, "whitelisted/disabled")
+    } else {
+      const now = Date.now()
+      if (Number.isFinite(acctCd.lastProbeAt) && now - acctCd.lastProbeAt < PLAN_GUARD_PROBE_INTERVAL_MS) {
+        return { plan: acctCd.plan || readLoginsPlan(s.who) || undefined, signIn: "kept", error: acctCd.message }
+      }
+      const liveCd = cooldowns.get(acctCooldownKey(s))
+      if (liveCd && liveCd.reason === "plan_downgraded") {
+        liveCd.lastProbeAt = now
+        savePersistentCooldowns()
+      }
+      try {
+        const p = await project(s, true, { allowDuringPlanCooldown: true, bypassTtl: true })
+        const guard = evaluatePlanGuard(s, p, true)
+        if (guard.blocked) {
+          return { plan: guard.classification.plan || acctCd.plan || undefined, signIn: "kept", error: guard.cooldown?.message || acctCd.message }
+        }
+      } catch (e) {
+        if (e instanceof SignedOut) return { error: e.message, signIn: "expired" }
+        return { plan: acctCd.plan || readLoginsPlan(s.who) || undefined, signIn: "kept", error: e?.message ?? acctCd.message }
+      }
+    }
+  }
   let l
   try {
     l = await modelInfo(s, true)
   } catch (e) {
     if (e instanceof SignedOut) return { error: e.message, signIn: "expired" }
+    const cdAfter = activeCooldown(acctCooldownKey(s))
+    if (cdAfter?.reason === "plan_downgraded") {
+      return { plan: cdAfter.plan || readLoginsPlan(s.who) || undefined, signIn: "kept", error: cdAfter.message }
+    }
     return { error: e?.message ?? String(e), signIn: "kept" }
   }
   const raw = catalogOf(l.infos)
@@ -3537,6 +4176,7 @@ async function signedIn(rt, access, expires, projectID, email) {
     email = who?.email
     if (!email) throw new Error("Google didn't say whose account this is")
   }
+  s.who = email
   // the project, found now so requests don't wait on it; a sign-in is kept
   // without one, found again on the first request
   try {
@@ -3768,16 +4408,30 @@ function pagesFromGrounding(reply, count) {
 }
 
 async function webSearch({ query, count } = {}, ctx = {}) {
+  reloadDynamicRules()
   const q = typeof query === "string" ? query.trim() : ""
   if (!q) throw new Error("query is required")
   const s = stateOf(await ctx.getAuth?.())
   if (!s) throw new Error("not signed in to Antigravity")
+  const acctCd = activeCooldown(GLOBAL_BREAKER_KEY) ?? activeCooldown(acctCooldownKey(s))
+  if (acctCd) {
+    if (acctCd.reason === "plan_downgraded" && (!isPlanGuardEnabled() || isFreeEmailWhitelisted(s.who))) {
+      clearPlanDowngradeCooldown(s, "whitelisted/disabled")
+    } else if (acctCd.reason !== "soft_rate_limit") {
+      if (acctCd.status === 401 || acctCd.oauthDead) throw new StatusError(401, acctCd.message)
+      throw new StatusError(acctCd.status, acctCd.message)
+    }
+  }
   let l
   try {
     l = await modelInfo(s)
   } catch (e) {
     if (e instanceof SignedOut) throw new StatusError(401, e.message)
     throw e
+  }
+  const guard = evaluatePlanGuard(s, l.project)
+  if (guard.blocked) {
+    throw new StatusError(429, guard.cooldown?.message || "Antigravity: account downgraded to free plan")
   }
   const picked = pickSearchModel(l.infos)
   const [sent, at] = sentID(catalogOf(l.infos), picked, "minimal", l.deprecated)
@@ -3988,6 +4642,9 @@ export const _internal = {
   isTransientTimeout,
   sanitizeResponseValue,
   sanitizeSchemaDescriptions,
+  POOL_AGENT_OPTIONS,
+  POOL_IDLE_EVICT_MS,
+  STREAM_SOCKET_TIMEOUT_MS,
   AccountPoolManager,
   accountPoolManager,
   accountFetch,
@@ -4006,4 +4663,31 @@ export const _internal = {
   token,
   tokenInFlight,
   signedIn,
+  LOGINS_PATH,
+  PLAN_GUARD_DEFAULT_COOLDOWN_MS,
+  PLAN_GUARD_PROBE_INTERVAL_MS,
+  PLAN_GUARD_ALERT_DEDUP_MS,
+  DEFAULT_MAX_REQ_PER_HOUR,
+  DEFAULT_MAX_REQ_PER_5M,
+  RATE_WINDOW_5M_MS,
+  RATE_WINDOW_1H_MS,
+  accountRateWindows,
+  planDowngradeAlerts,
+  loginsPlanCache,
+  isPlanGuardEnabled,
+  allowedFreeEmailsSet,
+  isFreeEmailWhitelisted,
+  planGuardCooldownMs,
+  isRateGuardEnabled,
+  rateGuardLimits,
+  maskAccountId,
+  readLoginsPlan,
+  classifyAccountPlan,
+  recordPlanDowngradeCooldown,
+  clearPlanDowngradeCooldown,
+  evaluatePlanGuard,
+  checkAndConsumeAccountRateLimit,
+  pruneRateTimestamps,
+  project,
+  modelInfo,
 }
