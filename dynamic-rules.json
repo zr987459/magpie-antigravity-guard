@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-11-25T00:07:58.778870+00:00",
+  "updatedAt": "2026-11-25T08:09:59.277798+00:00",
   "systemTag": "external_system_instructions",
   "clientMeta": {
     "cls": {
@@ -19,7 +19,7 @@
     "agyCli": {
       "source": "github:magpie-community/plugins/main/packages/agy-cli",
       "name": "@magpie-community/opencode-agy-cli-auth",
-      "version": "0.1.120",
+      "version": "0.1.121",
       "cloak_mjsSha256": "9929f6f5cef4ee9af603f5af0ead70448bbc2939066c954363bde0987081fd5f"
     },
     "bridge": {
