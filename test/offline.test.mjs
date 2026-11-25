@@ -250,7 +250,7 @@ assert.deepEqual(shapedPre, shapedDefault)
     deprecated: {},
   })
   _internal.projects.set(rtNoCarbon, { id: "proj-test", plan: "Google AI Pro", tier: "standard-tier", paid: "", credits: true, at: Date.now() })
-  _internal.accountRateWindows.delete(rtNoCarbon)
+  _internal.accountRateWindows.delete(_internal.accountSalt({ rt: rtNoCarbon }))
   try {
     const res = await _internal.complete(
       { rt: rtNoCarbon, who: "pro-no-4c@example.com", project: "proj-test", access: "tok", expires: Date.now() + 60_000 },
@@ -265,11 +265,11 @@ assert.deepEqual(shapedPre, shapedDefault)
     const body = await res.json()
     assert.match(body?.error?.message || "", /gemini-4-carbon.*not found/i)
     assert.equal(_internal.cooldowns.has(acctKey), false, "missing model must NOT set account cooldown")
-    assert.equal(_internal.accountRateWindows.has(rtNoCarbon), false, "missing model must NOT consume rate-limit budget")
+    assert.equal(_internal.accountRateWindows.has(_internal.accountSalt({ rt: rtNoCarbon })), false, "missing model must NOT consume rate-limit budget")
   } finally {
     _internal.lists.delete(rtNoCarbon)
     _internal.projects.delete(rtNoCarbon)
-    _internal.accountRateWindows.delete(rtNoCarbon)
+    _internal.accountRateWindows.delete(_internal.accountSalt({ rt: rtNoCarbon }))
   }
 }
 

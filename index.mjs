@@ -26,7 +26,9 @@ import crypto from "node:crypto"
 import fs from "node:fs"
 import http from "node:http"
 import https from "node:https"
+import net from "node:net"
 import path from "node:path"
+import tls from "node:tls"
 import { fileURLToPath } from "node:url"
 import zlib from "node:zlib"
 
@@ -114,6 +116,513 @@ class StatusError extends Error {
 }
 
 class SignedOut extends Error {}
+
+const accountSalt = (s) => (s?.rt ? crypto.createHash("sha256").update(s.rt).digest("hex").slice(0, 16) : "")
+const hashEmail = (email) => {
+  const clean = String(email ?? "").trim().toLowerCase()
+  return clean ? crypto.createHash("sha256").update(clean).digest("hex").slice(0, 16) : ""
+}
+
+const PLUGIN_DIR = (() => {
+  try {
+    return path.dirname(fileURLToPath(import.meta.url))
+  } catch {
+    return process.cwd()
+  }
+})()
+const DYNAMIC_RULES_PATH =
+  typeof process !== "undefined" && process.env?.MAGPIE_AG_DYNAMIC_RULES_PATH
+    ? path.resolve(process.env.MAGPIE_AG_DYNAMIC_RULES_PATH)
+    : path.join(PLUGIN_DIR, "dynamic-rules.json")
+const LOGINS_PATH =
+  typeof process !== "undefined" && process.env?.MAGPIE_AG_LOGINS_PATH
+    ? path.resolve(process.env.MAGPIE_AG_LOGINS_PATH)
+    : path.resolve(PLUGIN_DIR, "..", "..", "logins.json")
+const RULE_ALERTS_PATH =
+  typeof process !== "undefined" && process.env?.MAGPIE_AG_RULE_ALERTS_PATH
+    ? path.resolve(process.env.MAGPIE_AG_RULE_ALERTS_PATH)
+    : path.join(PLUGIN_DIR, "rule-alerts.jsonl")
+const SYNC_TRIGGER_PATH =
+  typeof process !== "undefined" && process.env?.MAGPIE_AG_SYNC_TRIGGER_PATH
+    ? path.resolve(process.env.MAGPIE_AG_SYNC_TRIGGER_PATH)
+    : path.join(PLUGIN_DIR, "sync-trigger.flag")
+const COOLDOWNS_PATH =
+  typeof process !== "undefined" && process.env?.MAGPIE_AG_COOLDOWNS_PATH
+    ? path.resolve(process.env.MAGPIE_AG_COOLDOWNS_PATH)
+    : path.join(PLUGIN_DIR, "cooldowns.json")
+const PROXIES_PATH =
+  typeof process !== "undefined" && process.env?.MAGPIE_AG_PROXIES_PATH
+    ? path.resolve(process.env.MAGPIE_AG_PROXIES_PATH)
+    : path.join(PLUGIN_DIR, "account-proxies.json")
+const WARMUP_PATH =
+  typeof process !== "undefined" && process.env?.MAGPIE_AG_WARMUP_PATH
+    ? path.resolve(process.env.MAGPIE_AG_WARMUP_PATH)
+    : path.join(PLUGIN_DIR, "account-warmup.json")
+
+function writeFileSafe(filePath, content, mode = undefined) {
+  try {
+    const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    try {
+      fs.writeFileSync(tmp, content, mode !== undefined ? { encoding: "utf8", mode } : "utf8")
+      if (mode !== undefined) {
+        try { fs.chmodSync(tmp, mode) } catch {}
+      }
+      fs.renameSync(tmp, filePath)
+      return true
+    } catch {
+      try {
+        if (fs.existsSync(tmp)) fs.unlinkSync(tmp)
+      } catch {}
+      return false
+    }
+  } catch {
+    return false
+  }
+}
+
+// ---- per-account proxy registry & tunnel helpers --------------------------------------
+
+const PROXIES_RELOAD_INTERVAL_MS = 10_000
+const PROXY_HANDSHAKE_TIMEOUT_MS = 15_000
+const ALLOWED_PROXY_PROTOCOLS = new Set(["http:", "https:", "socks5:", "socks5h:", "socks:"])
+
+const accountEmailsByKey = new Map() // poolKey (salt / rt) -> lowercase email
+const accountProxiesState = {
+  loaded: false,
+  checkedAt: 0,
+  mtimeMs: -1,
+  defaultProxy: null,
+  accounts: new Map(), // lowercase email or salt -> proxy descriptor or null
+  loggedSelections: new Map(), // poolKey -> masked proxy string
+  lastParseError: "",
+}
+
+function maskProxyUrl(raw) {
+  const s = String(raw ?? "").trim()
+  if (!s) return "direct"
+  try {
+    const u = new URL(s)
+    return `${u.protocol}//${u.host}`
+  } catch {
+    return s.replace(/\/\/[^/@\s]+@/, "//***@").replace(/[?#].*$/, "")
+  }
+}
+
+function parseProxyDescriptor(raw) {
+  if (raw === null || raw === undefined) return null
+  const s = String(raw).trim()
+  if (!s || s.toLowerCase() === "direct") return null
+  try {
+    const u = new URL(s)
+    if (!ALLOWED_PROXY_PROTOCOLS.has(u.protocol)) {
+      return { invalid: true, url: s, masked: maskProxyUrl(s), error: `unsupported proxy protocol ${u.protocol}` }
+    }
+    const hostname = String(u.hostname ?? "").trim()
+    if (!hostname) {
+      return { invalid: true, url: s, masked: maskProxyUrl(s), error: "missing proxy hostname" }
+    }
+    const protocol = u.protocol === "socks:" ? "socks5h:" : u.protocol
+    const defaultPort = protocol === "http:" ? 80 : protocol === "https:" ? 443 : 1080
+    const port = u.port ? Number(u.port) : defaultPort
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return { invalid: true, url: s, masked: maskProxyUrl(s), error: `invalid proxy port: ${u.port}` }
+    }
+    const username = u.username ? decodeURIComponent(u.username) : ""
+    const password = u.password ? decodeURIComponent(u.password) : ""
+    const authHeader =
+      username || password
+        ? "Basic " + Buffer.from(`${username}:${password}`, "utf8").toString("base64")
+        : ""
+    return {
+      invalid: false,
+      url: u.href,
+      protocol,
+      hostname,
+      port,
+      username,
+      password,
+      authHeader,
+      masked: `${protocol}//${u.host}`,
+    }
+  } catch (err) {
+    return { invalid: true, url: s, masked: maskProxyUrl(s), error: err?.message ?? "invalid proxy URL" }
+  }
+}
+
+function reloadAccountProxies(force = false) {
+  const now = Date.now()
+  if (!force && accountProxiesState.loaded && now - accountProxiesState.checkedAt < PROXIES_RELOAD_INTERVAL_MS) {
+    return accountProxiesState
+  }
+  accountProxiesState.checkedAt = now
+  try {
+    if (!fs.existsSync(PROXIES_PATH)) {
+      accountProxiesState.loaded = true
+      accountProxiesState.mtimeMs = -1
+      accountProxiesState.defaultProxy = null
+      accountProxiesState.accounts = new Map()
+      accountProxiesState.lastParseError = ""
+      return accountProxiesState
+    }
+    const st = fs.statSync(PROXIES_PATH)
+    if (!force && accountProxiesState.loaded && st.mtimeMs === accountProxiesState.mtimeMs) {
+      return accountProxiesState
+    }
+    const raw = JSON.parse(fs.readFileSync(PROXIES_PATH, "utf8"))
+    if (!isObj(raw)) throw new Error("account-proxies.json root must be a JSON object")
+    const nextDefault = parseProxyDescriptor(raw.default)
+    const nextAccounts = new Map()
+    if (isObj(raw.accounts)) {
+      for (const [k, v] of Object.entries(raw.accounts)) {
+        const keyNorm = String(k ?? "").trim().toLowerCase()
+        if (!keyNorm) continue
+        nextAccounts.set(keyNorm, parseProxyDescriptor(v))
+      }
+    }
+    accountProxiesState.loaded = true
+    accountProxiesState.mtimeMs = st.mtimeMs
+    accountProxiesState.defaultProxy = nextDefault
+    accountProxiesState.accounts = nextAccounts
+    accountProxiesState.lastParseError = ""
+  } catch (err) {
+    const msg = err?.message ?? String(err)
+    if (accountProxiesState.lastParseError !== msg) {
+      accountProxiesState.lastParseError = msg
+      console.warn(`[antigravity] failed to load account-proxies.json (${PROXIES_PATH}): ${msg}`)
+    }
+    if (!accountProxiesState.loaded) {
+      accountProxiesState.loaded = true
+      accountProxiesState.mtimeMs = -1
+      accountProxiesState.defaultProxy = { invalid: true, url: "", masked: "account-proxies.json", error: msg }
+      accountProxiesState.accounts = new Map()
+    }
+  }
+  return accountProxiesState
+}
+
+function rememberAccountIdentity(s) {
+  if (!s) return
+  const who = String(s.who ?? "").trim().toLowerCase()
+  if (!who) return
+  const salt = accountSalt(s)
+  if (salt) {
+    accountEmailsByKey.delete(salt)
+    accountEmailsByKey.set(salt, who)
+  }
+  if (s.rt) {
+    accountEmailsByKey.delete(s.rt)
+    accountEmailsByKey.set(s.rt, who)
+  }
+  while (accountEmailsByKey.size > 512) {
+    const oldest = accountEmailsByKey.keys().next().value
+    if (oldest === undefined) break
+    accountEmailsByKey.delete(oldest)
+  }
+}
+
+function resolveProxyForAccount(accountKey, emailHint = "") {
+  const state = reloadAccountProxies(false)
+  const rawKey = String(accountKey ?? "").trim()
+  const email = String(
+    emailHint ||
+      (rawKey ? accountEmailsByKey.get(rawKey) : "") ||
+      (rawKey ? accountEmailsByKey.get(rawKey.toLowerCase()) : "") ||
+      "",
+  )
+    .trim()
+    .toLowerCase()
+  let chosen = state.defaultProxy
+  if (email && state.accounts.has(email)) {
+    chosen = state.accounts.get(email) ?? null
+  } else if (rawKey && state.accounts.has(rawKey.toLowerCase())) {
+    chosen = state.accounts.get(rawKey.toLowerCase()) ?? null
+  }
+  const logKey = email || rawKey || "default"
+  const masked = chosen ? chosen.masked : "direct"
+  if (accountProxiesState.loggedSelections.get(logKey) !== masked) {
+    const hadPrev = accountProxiesState.loggedSelections.has(logKey)
+    accountProxiesState.loggedSelections.set(logKey, masked)
+    while (accountProxiesState.loggedSelections.size > 256) {
+      const oldest = accountProxiesState.loggedSelections.keys().next().value
+      if (oldest === undefined) break
+      accountProxiesState.loggedSelections.delete(oldest)
+    }
+    if (hadPrev || chosen) {
+      const whoLabel = email ? maskAccountId({ who: email }) : rawKey.slice(0, 12) || "default"
+      console.info(`[antigravity] proxy ${hadPrev ? "updated" : "active"}: account=${whoLabel} proxy=${masked}`)
+    }
+  }
+  return chosen
+}
+
+function formatConnectHost(host) {
+  const h = String(host ?? "").trim()
+  return h.includes(":") && !h.startsWith("[") ? `[${h}]` : h
+}
+
+function openHttpConnectTunnel(proxy, targetHost, targetPort, timeoutMs = PROXY_HANDSHAKE_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    let buf = Buffer.alloc(0)
+    const sock =
+      proxy.protocol === "https:"
+        ? tls.connect({ host: proxy.hostname, port: proxy.port, ...(net.isIP(proxy.hostname) ? {} : { servername: proxy.hostname }) })
+        : net.connect({ host: proxy.hostname, port: proxy.port })
+
+    const cleanup = () => {
+      clearTimeout(timer)
+      sock.removeListener("data", onData)
+      sock.removeListener("error", onError)
+      sock.removeListener("end", onEnd)
+      sock.removeListener("close", onClose)
+    }
+    const fail = (err) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      try { sock.destroy() } catch {}
+      reject(err)
+    }
+    const timer = setTimeout(() => {
+      fail(Object.assign(new Error(`proxy CONNECT timeout via ${proxy.masked}`), { code: "ETIMEDOUT" }))
+    }, timeoutMs)
+
+    const onError = (err) => fail(err)
+    const onEnd = () => fail(new Error(`proxy closed during CONNECT via ${proxy.masked}`))
+    const onClose = () => fail(new Error(`proxy socket closed during CONNECT via ${proxy.masked}`))
+    const onData = (chunk) => {
+      buf = Buffer.concat([buf, chunk])
+      if (buf.length > 16 * 1024) {
+        return fail(new Error(`proxy CONNECT response too large via ${proxy.masked}`))
+      }
+      const hdrEnd = buf.indexOf("\r\n\r\n")
+      if (hdrEnd < 0) return
+      const head = buf.slice(0, hdrEnd).toString("latin1")
+      const extra = buf.slice(hdrEnd + 4)
+      const statusLine = head.split("\r\n", 1)[0] || ""
+      if (!/^HTTP\/1\.[01]\s+200\b/i.test(statusLine)) {
+        return fail(new Error(`proxy CONNECT rejected (${statusLine.trim()}) via ${proxy.masked}`))
+      }
+      if (settled) return
+      settled = true
+      cleanup()
+      if (extra.length > 0) sock.unshift(extra)
+      resolve(sock)
+    }
+
+    sock.on("error", onError)
+    sock.on("end", onEnd)
+    sock.on("close", onClose)
+    sock.on("data", onData)
+
+    const connectTarget = `${formatConnectHost(targetHost)}:${targetPort}`
+    const lines = [
+      `CONNECT ${connectTarget} HTTP/1.1`,
+      `Host: ${connectTarget}`,
+      "Proxy-Connection: Keep-Alive",
+    ]
+    if (proxy.authHeader) lines.push(`Proxy-Authorization: ${proxy.authHeader}`)
+    const payload = lines.join("\r\n") + "\r\n\r\n"
+
+    const onReady = () => {
+      if (!settled) sock.write(payload)
+    }
+    if (proxy.protocol === "https:") {
+      sock.once("secureConnect", onReady)
+    } else {
+      sock.once("connect", onReady)
+    }
+  })
+}
+
+function encodeSocks5Addr(host) {
+  const clean = String(host ?? "").replace(/^\[|\]$/g, "")
+  if (net.isIPv4(clean)) {
+    return Buffer.from([0x01, ...clean.split(".").map((n) => Number(n) & 0xff)])
+  }
+  if (net.isIPv6(clean)) {
+    const parts = clean.split("::")
+    const left = parts[0] ? parts[0].split(":").filter(Boolean) : []
+    const right = parts.length > 1 && parts[1] ? parts[1].split(":").filter(Boolean) : []
+    const fill = Math.max(0, 8 - (left.length + right.length))
+    const groups = [...left, ...Array(fill).fill("0"), ...right]
+    const out = Buffer.alloc(17)
+    out[0] = 0x04
+    for (let i = 0; i < 8; i++) {
+      out.writeUInt16BE(parseInt(groups[i] || "0", 16) & 0xffff, 1 + i * 2)
+    }
+    return out
+  }
+  const hostBuf = Buffer.from(clean, "utf8")
+  if (hostBuf.length === 0 || hostBuf.length > 255) {
+    throw new Error(`invalid SOCKS5 target host length: ${clean}`)
+  }
+  return Buffer.concat([Buffer.from([0x03, hostBuf.length]), hostBuf])
+}
+
+function openSocks5Tunnel(proxy, targetHost, targetPort, timeoutMs = PROXY_HANDSHAKE_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    let stage = "greeting"
+    let buf = Buffer.alloc(0)
+    const sock = net.connect({ host: proxy.hostname, port: proxy.port })
+
+    const cleanup = () => {
+      clearTimeout(timer)
+      sock.removeListener("data", onData)
+      sock.removeListener("error", onError)
+      sock.removeListener("end", onEnd)
+      sock.removeListener("close", onClose)
+    }
+    const fail = (err) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      try { sock.destroy() } catch {}
+      reject(err)
+    }
+    const timer = setTimeout(() => {
+      fail(Object.assign(new Error(`SOCKS5 handshake timeout via ${proxy.masked}`), { code: "ETIMEDOUT" }))
+    }, timeoutMs)
+
+    const sendConnect = () => {
+      stage = "connect"
+      let addrBuf
+      try {
+        addrBuf = encodeSocks5Addr(targetHost)
+      } catch (e) {
+        return fail(e)
+      }
+      const portBuf = Buffer.alloc(2)
+      portBuf.writeUInt16BE(Number(targetPort) & 0xffff, 0)
+      sock.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00]), addrBuf, portBuf]))
+    }
+
+    const processBuf = () => {
+      if (stage === "greeting") {
+        if (buf.length < 2) return
+        if (buf[0] !== 0x05) return fail(new Error(`invalid SOCKS5 version ${buf[0]} from ${proxy.masked}`))
+        const method = buf[1]
+        buf = buf.slice(2)
+        if (method === 0x00) {
+          sendConnect()
+          if (buf.length > 0) processBuf()
+          return
+        }
+        if (method === 0x02) {
+          const uBuf = Buffer.from(proxy.username || "", "utf8")
+          const pBuf = Buffer.from(proxy.password || "", "utf8")
+          if (uBuf.length > 255 || pBuf.length > 255) {
+            return fail(new Error("SOCKS5 username/password exceeds 255 bytes"))
+          }
+          stage = "auth"
+          sock.write(Buffer.concat([Buffer.from([0x01, uBuf.length]), uBuf, Buffer.from([pBuf.length]), pBuf]))
+          if (buf.length > 0) processBuf()
+          return
+        }
+        return fail(new Error(`SOCKS5 proxy ${proxy.masked} rejected auth methods (${method})`))
+      }
+      if (stage === "auth") {
+        if (buf.length < 2) return
+        const status = buf[1]
+        buf = buf.slice(2)
+        if (status !== 0x00) {
+          return fail(new Error(`SOCKS5 authentication failed (${status}) via ${proxy.masked}`))
+        }
+        sendConnect()
+        if (buf.length > 0) processBuf()
+        return
+      }
+      if (stage === "connect") {
+        if (buf.length < 4) return
+        if (buf[0] !== 0x05) return fail(new Error(`invalid SOCKS5 connect reply from ${proxy.masked}`))
+        const rep = buf[1]
+        const atyp = buf[3]
+        let need = 4
+        if (atyp === 0x01) need += 4 + 2
+        else if (atyp === 0x04) need += 16 + 2
+        else if (atyp === 0x03) {
+          if (buf.length < 5) return
+          need += 1 + buf[4] + 2
+        } else {
+          return fail(new Error(`invalid SOCKS5 ATYP ${atyp} from ${proxy.masked}`))
+        }
+        if (buf.length < need) return
+        const extra = buf.slice(need)
+        if (rep !== 0x00) {
+          return fail(new Error(`SOCKS5 connect failed (rep=${rep}) via ${proxy.masked}`))
+        }
+        if (settled) return
+        settled = true
+        cleanup()
+        if (extra.length > 0) sock.unshift(extra)
+        resolve(sock)
+      }
+    }
+
+    const onError = (err) => fail(err)
+    const onEnd = () => fail(new Error(`SOCKS5 proxy closed connection via ${proxy.masked}`))
+    const onClose = () => fail(new Error(`SOCKS5 proxy socket closed via ${proxy.masked}`))
+    const onData = (chunk) => {
+      buf = Buffer.concat([buf, chunk])
+      processBuf()
+    }
+
+    sock.on("error", onError)
+    sock.on("end", onEnd)
+    sock.on("close", onClose)
+    sock.on("data", onData)
+    sock.once("connect", () => {
+      if (settled) return
+      const hasCreds = Boolean(proxy.username || proxy.password)
+      sock.write(hasCreds ? Buffer.from([0x05, 0x02, 0x00, 0x02]) : Buffer.from([0x05, 0x01, 0x00]))
+    })
+  })
+}
+
+class ProxyHttpAgent extends http.Agent {
+  constructor(proxyDesc, options) {
+    super(options)
+    this.proxyDesc = proxyDesc
+  }
+  createConnection(options, cb) {
+    const targetHost = options.host || options.hostname
+    const targetPort = Number(options.port) || 80
+    openSocks5Tunnel(this.proxyDesc, targetHost, targetPort)
+      .then((sock) => cb?.(null, sock))
+      .catch((err) => cb?.(err))
+  }
+}
+
+class ProxyHttpsAgent extends https.Agent {
+  constructor(proxyDesc, options) {
+    super(options)
+    this.proxyDesc = proxyDesc
+  }
+  createConnection(options, cb) {
+    const targetHost = options.host || options.hostname
+    const targetPort = Number(options.port) || 443
+    const openTunnel =
+      this.proxyDesc.protocol === "socks5:" || this.proxyDesc.protocol === "socks5h:"
+        ? openSocks5Tunnel(this.proxyDesc, targetHost, targetPort)
+        : openHttpConnectTunnel(this.proxyDesc, targetHost, targetPort)
+    openTunnel
+      .then((sock) => {
+        const sniHost = options.servername || targetHost
+        const tlsOpts = {
+          socket: sock,
+          ...(sniHost && !net.isIP(sniHost) ? { servername: sniHost } : {}),
+        }
+        if (options.ca !== undefined) tlsOpts.ca = options.ca
+        if (options.cert !== undefined) tlsOpts.cert = options.cert
+        if (options.key !== undefined) tlsOpts.key = options.key
+        if (options.rejectUnauthorized !== undefined) tlsOpts.rejectUnauthorized = options.rejectUnauthorized
+        const tlsSock = tls.connect(tlsOpts)
+        cb?.(null, tlsSock)
+      })
+      .catch((err) => cb?.(err))
+  }
+}
 
 // ---- per-account isolated HTTP/HTTPS connection pool ----------------------------------
 
@@ -245,6 +754,7 @@ class AccountPoolManager {
     }
     entry = {
       key,
+      proxyUrl: null,
       httpsAgent: null,
       httpAgent: null,
       lastUsedAt: Date.now(),
@@ -253,14 +763,34 @@ class AccountPoolManager {
     return entry
   }
 
-  getAgent(accountKey, protocol) {
+  getAgent(accountKey, protocol, proxyDesc = null) {
     const entry = this.getEntry(accountKey)
+    const nextProxyUrl = proxyDesc && !proxyDesc.invalid ? proxyDesc.url : null
+    if (entry.proxyUrl !== nextProxyUrl) {
+      try { entry.httpsAgent?.destroy() } catch {}
+      try { entry.httpAgent?.destroy() } catch {}
+      entry.httpsAgent = null
+      entry.httpAgent = null
+      entry.proxyUrl = nextProxyUrl
+    }
     if (protocol === "http:") {
-      if (!entry.httpAgent) entry.httpAgent = this.installIdleEviction(new http.Agent(this.agentOptions))
+      if (!entry.httpAgent) {
+        const baseAgent =
+          proxyDesc && !proxyDesc.forwardHttpProxy && (proxyDesc.protocol === "socks5:" || proxyDesc.protocol === "socks5h:")
+            ? new ProxyHttpAgent(proxyDesc, this.agentOptions)
+            : new http.Agent(this.agentOptions)
+        entry.httpAgent = this.installIdleEviction(baseAgent)
+      }
       this.evictIdleSockets(entry.httpAgent, this.idleEvictMs)
       return entry.httpAgent
     }
-    if (!entry.httpsAgent) entry.httpsAgent = this.installIdleEviction(new https.Agent(this.agentOptions))
+    if (!entry.httpsAgent) {
+      const baseAgent =
+        proxyDesc && !proxyDesc.invalid && !proxyDesc.forwardHttpProxy
+          ? new ProxyHttpsAgent(proxyDesc, this.agentOptions)
+          : new https.Agent(this.agentOptions)
+      entry.httpsAgent = this.installIdleEviction(baseAgent)
+    }
     this.evictIdleSockets(entry.httpsAgent, this.idleEvictMs)
     return entry.httpsAgent
   }
@@ -347,9 +877,20 @@ function accountFetchOnce(accountKey, urlObj, method, reqHeaders, bodyBuf, signa
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(toAbortError(signal.reason))
 
+    const proxyDesc = opts?.proxyDesc !== undefined ? opts.proxyDesc : resolveProxyForAccount(accountKey, opts?.accountEmail)
+    if (proxyDesc?.invalid) {
+      return reject(new StatusError(502, `Antigravity: invalid proxy configuration (${proxyDesc.masked}): ${proxyDesc.error}`))
+    }
+
     const protocol = urlObj.protocol === "http:" ? "http:" : "https:"
-    const transport = protocol === "http:" ? http : https
-    const agent = accountPoolManager.getAgent(accountKey, protocol)
+    const isHttpViaHttpProxy =
+      protocol === "http:" && proxyDesc && (proxyDesc.protocol === "http:" || proxyDesc.protocol === "https:")
+    const transportProtocol = isHttpViaHttpProxy ? proxyDesc.protocol : protocol
+    const transport = transportProtocol === "http:" ? http : https
+    const effectiveProxyDesc = isHttpViaHttpProxy
+      ? { ...proxyDesc, forwardHttpProxy: true }
+      : proxyDesc
+    const agent = accountPoolManager.getAgent(accountKey, transportProtocol, effectiveProxyDesc)
     const streamSocketTimeoutMs = Math.max(STREAM_SOCKET_TIMEOUT_MS, timeouts.streamIdleMs + 15_000, Number(opts?.streamSocketTimeoutMs) || 0)
     const preHeaderTimeoutMs = Number(opts?.preHeaderTimeoutMs) > 0 ? Number(opts.preHeaderTimeoutMs) : streamSocketTimeoutMs
 
@@ -406,16 +947,28 @@ function accountFetchOnce(accountKey, urlObj, method, reqHeaders, bodyBuf, signa
 
     if (signal) signal.addEventListener("abort", onAbort, { once: true })
 
+    const finalHeaders = isHttpViaHttpProxy
+      ? {
+          Host: urlObj.host,
+          ...reqHeaders,
+          "Proxy-Connection": "Keep-Alive",
+          ...(proxyDesc.authHeader ? { "Proxy-Authorization": proxyDesc.authHeader } : {}),
+        }
+      : reqHeaders
+    const reqOpts = {
+      protocol: transportProtocol,
+      hostname: isHttpViaHttpProxy ? proxyDesc.hostname : urlObj.hostname,
+      port: isHttpViaHttpProxy ? proxyDesc.port : urlObj.port || (protocol === "http:" ? 80 : 443),
+      path: isHttpViaHttpProxy ? urlObj.href : urlObj.pathname + urlObj.search,
+      method,
+      headers: finalHeaders,
+      agent,
+      ...(opts?.ca !== undefined ? { ca: opts.ca } : {}),
+      ...(opts?.rejectUnauthorized !== undefined ? { rejectUnauthorized: opts.rejectUnauthorized } : {}),
+    }
+
     const req = transport.request(
-      {
-        protocol,
-        hostname: urlObj.hostname,
-        port: urlObj.port || (protocol === "http:" ? 80 : 443),
-        path: urlObj.pathname + urlObj.search,
-        method,
-        headers: reqHeaders,
-        agent,
-      },
+      reqOpts,
       (res) => {
         resRef = res
         headersReceived = true
@@ -573,6 +1126,9 @@ async function accountFetch(accountKey, input, init = {}) {
   const fetchOpts = {
     preHeaderTimeoutMs: init?.preHeaderTimeoutMs,
     streamSocketTimeoutMs: init?.streamSocketTimeoutMs,
+    accountEmail: init?.accountEmail,
+    ca: init?.ca,
+    rejectUnauthorized: init?.rejectUnauthorized,
   }
   try {
     return await accountFetchOnce(accountKey, urlObj, method, headers, bodyBuf, signal, fetchOpts)
@@ -784,6 +1340,7 @@ function recordOAuthDeadCooldown(s, message) {
 // token is an access token for s, minted again from its refresh token
 // when less than two minutes of the last are left (per-account singleflight)
 async function token(s) {
+  rememberAccountIdentity(s)
   const deadCd = activeCooldown(acctCooldownKey(s))
   if (deadCd && (deadCd.status === 401 || deadCd.oauthDead)) {
     throw new SignedOut(deadCd.message)
@@ -821,33 +1378,6 @@ async function token(s) {
   return promise
 }
 
-const PLUGIN_DIR = (() => {
-  try {
-    return path.dirname(fileURLToPath(import.meta.url))
-  } catch {
-    return process.cwd()
-  }
-})()
-const DYNAMIC_RULES_PATH =
-  typeof process !== "undefined" && process.env?.MAGPIE_AG_DYNAMIC_RULES_PATH
-    ? path.resolve(process.env.MAGPIE_AG_DYNAMIC_RULES_PATH)
-    : path.join(PLUGIN_DIR, "dynamic-rules.json")
-const LOGINS_PATH =
-  typeof process !== "undefined" && process.env?.MAGPIE_AG_LOGINS_PATH
-    ? path.resolve(process.env.MAGPIE_AG_LOGINS_PATH)
-    : path.resolve(PLUGIN_DIR, "..", "..", "logins.json")
-const RULE_ALERTS_PATH =
-  typeof process !== "undefined" && process.env?.MAGPIE_AG_RULE_ALERTS_PATH
-    ? path.resolve(process.env.MAGPIE_AG_RULE_ALERTS_PATH)
-    : path.join(PLUGIN_DIR, "rule-alerts.jsonl")
-const SYNC_TRIGGER_PATH =
-  typeof process !== "undefined" && process.env?.MAGPIE_AG_SYNC_TRIGGER_PATH
-    ? path.resolve(process.env.MAGPIE_AG_SYNC_TRIGGER_PATH)
-    : path.join(PLUGIN_DIR, "sync-trigger.flag")
-const COOLDOWNS_PATH =
-  typeof process !== "undefined" && process.env?.MAGPIE_AG_COOLDOWNS_PATH
-    ? path.resolve(process.env.MAGPIE_AG_COOLDOWNS_PATH)
-    : path.join(PLUGIN_DIR, "cooldowns.json")
 const DEFAULT_REMOTE_RULES_URL = "https://raw.githubusercontent.com/zr987459/magpie-antigravity-guard/main/dynamic-rules.json"
 const REMOTE_SYNC_INTERVAL_MS = 30 * 60 * 1000
 const REMOTE_SYNC_TIMEOUT_MS = 5000
@@ -863,24 +1393,6 @@ const remoteSyncState = {
 function remoteRulesUrl() {
   const override = typeof process !== "undefined" ? String(process.env?.MAGPIE_AG_GUARD_RULES_URL ?? "").trim() : ""
   return override || DEFAULT_REMOTE_RULES_URL
-}
-
-function writeFileSafe(filePath, content) {
-  try {
-    const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-    try {
-      fs.writeFileSync(tmp, content, "utf8")
-      fs.renameSync(tmp, filePath)
-      return true
-    } catch {
-      try {
-        if (fs.existsSync(tmp)) fs.unlinkSync(tmp)
-      } catch {}
-      return false
-    }
-  } catch {
-    return false
-  }
 }
 
 const cooldowns = new Map() // "global:breaker" | "acct:<rt>" | "model:<rt>\0<model>" -> { until, status, message, strikes, persisted? }
@@ -900,21 +1412,48 @@ const PLAN_GUARD_DEFAULT_COOLDOWN_MS = 6 * 60 * 60 * 1000
 const PLAN_GUARD_PROBE_INTERVAL_MS = 10 * 60 * 1000
 const PLAN_GUARD_ALERT_DEDUP_MS = 6 * 60 * 60 * 1000
 const LOGINS_CHECK_INTERVAL_MS = 5 * 1000
+const RATE_WINDOW_1M_MS = 60 * 1000
 const RATE_WINDOW_5M_MS = 5 * 60 * 1000
 const RATE_WINDOW_1H_MS = 60 * 60 * 1000
-const DEFAULT_MAX_REQ_PER_HOUR = 200
-const DEFAULT_MAX_REQ_PER_5M = 45
+const DEFAULT_MAX_INFLIGHT = 2
+const DEFAULT_MAX_REQ_PER_1M = 8
+const DEFAULT_MAX_REQ_PER_5M = 30
+const DEFAULT_MAX_REQ_PER_HOUR = 120
 const DEFAULT_RATE_COOLDOWN_MIN_MS = 15 * 1000
 const DEFAULT_RATE_COOLDOWN_MAX_MS = 5 * 60 * 1000
-const DEFAULT_ULTRA_MAX_REQ_PER_HOUR = 600
-const DEFAULT_ULTRA_MAX_REQ_PER_5M = 150
-const DEFAULT_ULTRA_RATE_COOLDOWN_MIN_MS = 15 * 1000
-const DEFAULT_ULTRA_RATE_COOLDOWN_MAX_MS = 60 * 1000
+const DEFAULT_ULTRA_MAX_INFLIGHT = 2
+const DEFAULT_ULTRA_MAX_REQ_PER_1M = 10
+const DEFAULT_ULTRA_MAX_REQ_PER_5M = 40
+const DEFAULT_ULTRA_MAX_REQ_PER_HOUR = 180
+const DEFAULT_ULTRA_RATE_COOLDOWN_MIN_MS = 30 * 1000
+const DEFAULT_ULTRA_RATE_COOLDOWN_MAX_MS = 180 * 1000
+const DEFAULT_WARMUP_HOURS = 48
+const WARMUP_D1_LIMITS = {
+  maxInflight: 1,
+  maxPer1m: 4,
+  maxPer5m: 12,
+  maxPerHour: 45,
+  minCooldownMs: 45 * 1000,
+  maxCooldownMs: 180 * 1000,
+}
+const WARMUP_D2_LIMITS = {
+  maxInflight: 1,
+  maxPer1m: 6,
+  maxPer5m: 22,
+  maxPerHour: 90,
+  minCooldownMs: 30 * 1000,
+  maxCooldownMs: 150 * 1000,
+}
+const INFLIGHT_RETRY_AFTER_SEC = 5
+const DEFAULT_INFLIGHT_LEASE_TTL_MS = 5 * 60 * 1000
 const ULTRA_PLAN_RE = /\b(?:ultra|g1-ultra-tier)\b/i
 
 const accountRateWindows = new Map() // acctKey -> number[] (epoch ms timestamps)
+const accountInflightLeases = new Map() // acctKey -> Set<{ id, acquiredAt, lastActivityAt, tier, released }>
 const planDowngradeAlerts = new Map() // acctKey -> lastAlertAt ms
 const loginsPlanCache = { checkedAt: 0, mtimeMs: -1, byEmail: new Map() }
+const accountWarmupState = { loaded: false, mtimeMs: -1, accounts: {}, loggedTiers: new Map() }
+let nextInflightLeaseId = 1
 
 function parseBoolEnv(name) {
   if (typeof process === "undefined" || !process.env) return undefined
@@ -934,6 +1473,25 @@ function parseNonNegIntEnv(name, fallback) {
   const n = Number(String(raw).trim())
   if (!Number.isFinite(n) || !Number.isInteger(n)) return fallback
   return n <= 0 ? 0 : n
+}
+
+function parseNonNegNumEnv(name, fallback) {
+  if (typeof process === "undefined" || !process.env) return fallback
+  const raw = process.env[name]
+  if (raw === undefined || raw === null || String(raw).trim() === "") return fallback
+  const n = Number(String(raw).trim())
+  if (!Number.isFinite(n)) return fallback
+  return n <= 0 ? 0 : n
+}
+
+function warmupHours() {
+  return parseNonNegNumEnv("AG_WARMUP_HOURS", DEFAULT_WARMUP_HOURS)
+}
+
+function inflightLeaseTtlMs() {
+  const envVal = parseNonNegIntEnv("AG_INFLIGHT_LEASE_TTL_MS", 0)
+  if (envVal > 0) return envVal
+  return Math.max(DEFAULT_INFLIGHT_LEASE_TTL_MS, timeouts.streamIdleMs + 120_000)
 }
 
 function isPlanGuardEnabled() {
@@ -994,19 +1552,25 @@ function isUltraAccount(s, projectInfo = null) {
 }
 
 function rateGuardLimits(isUltra = false) {
-  const maxPerHour = isUltra
-    ? parseNonNegIntEnv("AG_ULTRA_MAX_REQ_PER_HOUR", DEFAULT_ULTRA_MAX_REQ_PER_HOUR)
-    : parseNonNegIntEnv("AG_MAX_REQ_PER_HOUR", DEFAULT_MAX_REQ_PER_HOUR)
+  const maxInflight = isUltra
+    ? parseNonNegIntEnv("AG_ULTRA_MAX_INFLIGHT", DEFAULT_ULTRA_MAX_INFLIGHT)
+    : parseNonNegIntEnv("AG_MAX_INFLIGHT", DEFAULT_MAX_INFLIGHT)
+  const maxPer1m = isUltra
+    ? parseNonNegIntEnv("AG_ULTRA_MAX_REQ_PER_1M", DEFAULT_ULTRA_MAX_REQ_PER_1M)
+    : parseNonNegIntEnv("AG_MAX_REQ_PER_1M", DEFAULT_MAX_REQ_PER_1M)
   const maxPer5m = isUltra
     ? parseNonNegIntEnv("AG_ULTRA_MAX_REQ_PER_5M", DEFAULT_ULTRA_MAX_REQ_PER_5M)
     : parseNonNegIntEnv("AG_MAX_REQ_PER_5M", DEFAULT_MAX_REQ_PER_5M)
+  const maxPerHour = isUltra
+    ? parseNonNegIntEnv("AG_ULTRA_MAX_REQ_PER_HOUR", DEFAULT_ULTRA_MAX_REQ_PER_HOUR)
+    : parseNonNegIntEnv("AG_MAX_REQ_PER_HOUR", DEFAULT_MAX_REQ_PER_HOUR)
   const defMin = isUltra ? DEFAULT_ULTRA_RATE_COOLDOWN_MIN_MS : DEFAULT_RATE_COOLDOWN_MIN_MS
   const defMax = isUltra ? DEFAULT_ULTRA_RATE_COOLDOWN_MAX_MS : DEFAULT_RATE_COOLDOWN_MAX_MS
   const rawMin = parseNonNegIntEnv(isUltra ? "AG_ULTRA_RATE_COOLDOWN_MIN_MS" : "AG_RATE_COOLDOWN_MIN_MS", defMin)
   const minCooldownMs = Math.min(300_000, Math.max(1_000, rawMin || defMin))
   const rawMax = parseNonNegIntEnv(isUltra ? "AG_ULTRA_RATE_COOLDOWN_MAX_MS" : "AG_RATE_COOLDOWN_MAX_MS", defMax)
   const maxCooldownMs = Math.max(minCooldownMs, Math.min(30 * 60 * 1000, rawMax || defMax))
-  return { maxPerHour, maxPer5m, minCooldownMs, maxCooldownMs }
+  return { maxInflight, maxPer1m, maxPer5m, maxPerHour, minCooldownMs, maxCooldownMs }
 }
 
 function maskAccountId(s) {
@@ -1069,7 +1633,7 @@ function savePersistentCooldowns() {
     const now = Date.now()
     const out = {}
     for (const [k, v] of cooldowns.entries()) {
-      if (v && Number.isFinite(v.until) && v.until - now >= COOLDOWN_PERSIST_MIN_MS) {
+      if (v && v.persisted !== false && v.reason !== "soft_rate_limit" && Number.isFinite(v.until) && v.until - now >= COOLDOWN_PERSIST_MIN_MS) {
         out[k] = {
           until: v.until,
           status: v.status,
@@ -1147,9 +1711,7 @@ const PAID_PLAN_RE = /\b(?:pro|ultra|enterprise|team|business)\b|g1[-_]?(?:pro|u
 const FREE_PLAN_RE = /\b(?:starter|free)\b/i
 const FREE_TIER_ID_RE = /^(?:free|starter|standard)(?:-tier)?$/i
 
-function readLoginsPlan(who, force = false) {
-  const whoNorm = String(who ?? "").trim().toLowerCase()
-  if (!whoNorm) return ""
+function refreshLoginsCache(force = false) {
   const now = Date.now()
   if (force || now - loginsPlanCache.checkedAt >= LOGINS_CHECK_INTERVAL_MS) {
     loginsPlanCache.checkedAt = now
@@ -1165,7 +1727,9 @@ function readLoginsPlan(who, force = false) {
             if (agent && !agent.startsWith(`plugin:${PROVIDER}`)) continue
             const user = String(item.user ?? "").trim().toLowerCase()
             const plan = String(item.plan ?? "").trim()
-            if (user && plan) next.set(user, plan)
+            const seen = String(item.seen ?? "").trim()
+            const seenMs = seen ? Date.parse(seen) : NaN
+            if (user) next.set(user, { plan, seen, seenMs: Number.isFinite(seenMs) ? seenMs : null })
           }
         }
         loginsPlanCache.byEmail = next
@@ -1178,7 +1742,23 @@ function readLoginsPlan(who, force = false) {
       }
     }
   }
-  return loginsPlanCache.byEmail.get(whoNorm) ?? ""
+  return loginsPlanCache.byEmail
+}
+
+function readLoginsEntry(who, force = false) {
+  const whoNorm = String(who ?? "").trim().toLowerCase()
+  if (!whoNorm) return null
+  const map = refreshLoginsCache(force)
+  return map.get(whoNorm) ?? null
+}
+
+function readAllLoginsEntries(force = false) {
+  const map = refreshLoginsCache(force)
+  return [...map.entries()]
+}
+
+function readLoginsPlan(who, force = false) {
+  return readLoginsEntry(who, force)?.plan ?? ""
 }
 
 function classifyAccountPlan({ plan = "", tier = "", paid = "", loginsPlan = "" } = {}) {
@@ -1269,6 +1849,9 @@ function clearPlanDowngradeCooldown(s, reasonNote = "") {
   savePersistentCooldowns()
   const alertKey = accountSalt(s) || s.who || s.rt
   planDowngradeAlerts.delete(alertKey)
+  if (/active paid plan/i.test(String(reasonNote ?? ""))) {
+    markAccountUpgraded(s, reasonNote)
+  }
   if (reasonNote) {
     console.info(`[antigravity] plan-guard cleared cooldown for account=${maskAccountId(s)}: ${reasonNote}`)
   }
@@ -1306,6 +1889,308 @@ function evaluatePlanGuard(s, projectInfo = null, forceLogins = false) {
   return { blocked: false, classification: cls }
 }
 
+function classifyPlanKind(label = "") {
+  const s = String(label ?? "").trim()
+  if (!s) return "unknown"
+  if (ULTRA_PLAN_RE.test(s)) return "ultra"
+  if (PAID_PLAN_RE.test(s)) return "pro"
+  if (FREE_PLAN_RE.test(s) || FREE_TIER_ID_RE.test(s)) return "free"
+  return "unknown"
+}
+
+function accountPlanDescriptor(s, projectInfo = null) {
+  const proj = projectInfo ?? (s?.rt ? projects.get(s.rt) : null)
+  const loginsPlan = s?.who ? readLoginsPlan(s.who) : ""
+  const candidates = [proj?.paid, proj?.tier, proj?.plan, loginsPlan].filter((v) => String(v ?? "").trim())
+  const label = candidates[0] ? String(candidates[0]).trim() : ""
+  if (candidates.some((v) => ULTRA_PLAN_RE.test(String(v)))) {
+    return { kind: "ultra", label: label || "Google AI Ultra" }
+  }
+  if (candidates.some((v) => PAID_PLAN_RE.test(String(v)))) {
+    return { kind: "pro", label: label || "Google AI Pro" }
+  }
+  if (candidates.some((v) => FREE_PLAN_RE.test(String(v)) || FREE_TIER_ID_RE.test(String(v)))) {
+    return { kind: "free", label: label || "free-tier" }
+  }
+  return { kind: "unknown", label }
+}
+
+function reloadAccountWarmup(force = false) {
+  try {
+    if (!fs.existsSync(WARMUP_PATH)) {
+      if (force || !accountWarmupState.loaded) {
+        accountWarmupState.loaded = true
+        accountWarmupState.mtimeMs = -1
+        accountWarmupState.accounts = {}
+      }
+      return accountWarmupState
+    }
+    const st = fs.statSync(WARMUP_PATH)
+    if (!force && accountWarmupState.loaded && st.mtimeMs === accountWarmupState.mtimeMs) {
+      return accountWarmupState
+    }
+    const raw = JSON.parse(fs.readFileSync(WARMUP_PATH, "utf8"))
+    const accounts = isObj(raw?.accounts) ? raw.accounts : isObj(raw) && !("version" in raw) ? raw : {}
+    const cleanAccounts = {}
+    for (const [k, v] of Object.entries(accounts)) {
+      if (!isObj(v) || !Number.isFinite(Number(v.firstSeenAt))) continue
+      cleanAccounts[k] = {
+        ...(typeof v.masked === "string" && v.masked ? { masked: v.masked } : {}),
+        ...(typeof v.emailHash === "string" && v.emailHash ? { emailHash: v.emailHash } : {}),
+        ...(typeof v.rtSalt === "string" && v.rtSalt ? { rtSalt: v.rtSalt } : {}),
+        firstSeenAt: Number(v.firstSeenAt),
+        upgradedAt: Number.isFinite(Number(v.upgradedAt)) ? Number(v.upgradedAt) : null,
+        lastPlan: typeof v.lastPlan === "string" ? v.lastPlan : "",
+        lastTier: typeof v.lastTier === "string" ? v.lastTier : "",
+        ...(Number.isFinite(Number(v.updatedAt)) ? { updatedAt: Number(v.updatedAt) } : {}),
+      }
+    }
+    accountWarmupState.loaded = true
+    accountWarmupState.mtimeMs = st.mtimeMs
+    accountWarmupState.accounts = cleanAccounts
+  } catch {
+    if (!accountWarmupState.loaded) {
+      accountWarmupState.loaded = true
+      accountWarmupState.mtimeMs = -1
+      accountWarmupState.accounts = {}
+    }
+  }
+  return accountWarmupState
+}
+
+function saveAccountWarmup() {
+  try {
+    const payload = {
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      accounts: accountWarmupState.accounts,
+    }
+    if (writeFileSafe(WARMUP_PATH, JSON.stringify(payload, null, 2) + "\n", 0o600)) {
+      try {
+        accountWarmupState.mtimeMs = fs.statSync(WARMUP_PATH).mtimeMs
+      } catch {}
+      return true
+    }
+  } catch {}
+  return false
+}
+
+function findWarmupEntry(rtSalt, emailHash) {
+  const accounts = accountWarmupState.accounts
+  if (rtSalt && isObj(accounts[rtSalt])) {
+    return { key: rtSalt, rec: accounts[rtSalt] }
+  }
+  if (emailHash) {
+    const emailKey = `email:${emailHash}`
+    if (isObj(accounts[emailKey])) {
+      return { key: emailKey, rec: accounts[emailKey] }
+    }
+    for (const [k, rec] of Object.entries(accounts)) {
+      if (isObj(rec) && rec.emailHash === emailHash) {
+        return { key: k, rec }
+      }
+    }
+  }
+  return null
+}
+
+function computeWarmupTierName(planKind, ageMs, wHours) {
+  const prefix = planKind === "ultra" ? "ultra" : "pro"
+  if (wHours <= 0) return `${prefix}-mature`
+  const warmupMs = wHours * 3600_000
+  const d1Ms = warmupMs * 0.5
+  if (ageMs < d1Ms) return `${prefix}-warmup-d1`
+  if (ageMs < warmupMs) return `${prefix}-warmup-d2`
+  return `${prefix}-mature`
+}
+
+function seedWarmupFromLogins(now = Date.now(), force = false) {
+  reloadAccountWarmup(force)
+  const wHours = warmupHours()
+  const warmupMs = wHours * 3600_000
+  const entries = readAllLoginsEntries(force)
+  if (entries.length === 0) return false
+  let dirty = false
+  for (const [email, info] of entries) {
+    if (!email || !Number.isFinite(info?.seenMs)) continue
+    if (warmupMs > 0 && now - info.seenMs < warmupMs) continue
+    const eHash = hashEmail(email)
+    const found = findWarmupEntry("", eHash)
+    const planKind = classifyPlanKind(info.plan)
+    const tierName = `${planKind === "ultra" ? "ultra" : "pro"}-mature`
+    if (!found) {
+      const key = `email:${eHash}`
+      accountWarmupState.accounts[key] = {
+        masked: maskAccountId({ who: email }),
+        emailHash: eHash,
+        firstSeenAt: info.seenMs,
+        upgradedAt: null,
+        lastPlan: info.plan || "",
+        lastTier: tierName,
+        updatedAt: now,
+      }
+      dirty = true
+    } else if (info.seenMs < found.rec.firstSeenAt) {
+      found.rec.firstSeenAt = info.seenMs
+      if (!found.rec.lastPlan && info.plan) found.rec.lastPlan = info.plan
+      if (!found.rec.lastTier) found.rec.lastTier = tierName
+      found.rec.updatedAt = now
+      dirty = true
+    }
+  }
+  if (dirty) saveAccountWarmup()
+  return dirty
+}
+
+function markAccountUpgraded(s, reasonNote = "", now = Date.now()) {
+  if (!s?.rt) return null
+  reloadAccountWarmup(false)
+  const rtSalt = accountSalt(s) || s.rt
+  const eHash = hashEmail(s.who)
+  let found = findWarmupEntry(rtSalt, eHash)
+  const planDesc = accountPlanDescriptor(s, projects.get(s.rt) ?? null)
+  const wHours = warmupHours()
+  const tierName = computeWarmupTierName(planDesc.kind, 0, wHours)
+  if (!found) {
+    const rec = {
+      masked: maskAccountId(s),
+      ...(eHash ? { emailHash: eHash } : {}),
+      rtSalt,
+      firstSeenAt: now,
+      upgradedAt: now,
+      lastPlan: planDesc.label || reasonNote || "paid",
+      lastTier: tierName,
+      updatedAt: now,
+    }
+    accountWarmupState.accounts[rtSalt] = rec
+    saveAccountWarmup()
+    return rec
+  }
+  if (found.key !== rtSalt) {
+    delete accountWarmupState.accounts[found.key]
+    accountWarmupState.accounts[rtSalt] = found.rec
+  }
+  found.rec.rtSalt = rtSalt
+  if (eHash) found.rec.emailHash = eHash
+  found.rec.masked = maskAccountId(s)
+  found.rec.upgradedAt = now
+  if (planDesc.label) found.rec.lastPlan = planDesc.label
+  found.rec.lastTier = tierName
+  found.rec.updatedAt = now
+  saveAccountWarmup()
+  console.info(`[antigravity] warmup-guard upgrade reset: account=${maskAccountId(s)} tier=${tierName} reason=${reasonNote || "plan_upgrade"}`)
+  return found.rec
+}
+
+function resolveAccountRateTier(s, now = Date.now(), projectInfo = null) {
+  rememberAccountIdentity(s)
+  reloadAccountWarmup(false)
+  const wHours = warmupHours()
+  const warmupMs = wHours * 3600_000
+  const planDesc = accountPlanDescriptor(s, projectInfo)
+  const isUltra = planDesc.kind === "ultra"
+  const rtSalt = s?.rt ? accountSalt(s) || s.rt : ""
+  const eHash = hashEmail(s?.who)
+  const masked = maskAccountId(s)
+  const loginsEntry = s?.who ? readLoginsEntry(s.who) : null
+
+  let rec = null
+  let dirty = false
+  if (rtSalt || eHash) {
+    const found = findWarmupEntry(rtSalt, eHash)
+    if (!found) {
+      let initialSeenAt = now
+      if (loginsEntry?.seenMs && warmupMs > 0 && now - loginsEntry.seenMs >= warmupMs) {
+        initialSeenAt = loginsEntry.seenMs
+      }
+      const key = rtSalt || `email:${eHash}`
+      rec = {
+        masked,
+        ...(eHash ? { emailHash: eHash } : {}),
+        ...(rtSalt ? { rtSalt } : {}),
+        firstSeenAt: initialSeenAt,
+        upgradedAt: null,
+        lastPlan: planDesc.label || "",
+        lastTier: "",
+        updatedAt: now,
+      }
+      accountWarmupState.accounts[key] = rec
+      dirty = true
+    } else {
+      rec = found.rec
+      if (rtSalt && found.key !== rtSalt) {
+        delete accountWarmupState.accounts[found.key]
+        accountWarmupState.accounts[rtSalt] = rec
+        rec.rtSalt = rtSalt
+        dirty = true
+      }
+      if (eHash && rec.emailHash !== eHash) {
+        rec.emailHash = eHash
+        dirty = true
+      }
+      if (masked && rec.masked !== masked) {
+        rec.masked = masked
+        dirty = true
+      }
+      const prevKind = classifyPlanKind(rec.lastPlan)
+      if (prevKind === "free" && (planDesc.kind === "pro" || planDesc.kind === "ultra")) {
+        rec.upgradedAt = now
+        dirty = true
+        console.info(`[antigravity] warmup-guard upgrade detected: account=${masked} from="${rec.lastPlan}" to="${planDesc.label}" -> entering ${wHours}h warmup`)
+      }
+      if (planDesc.label && rec.lastPlan !== planDesc.label) {
+        rec.lastPlan = planDesc.label
+        dirty = true
+      }
+    }
+  }
+
+  const startAt = rec ? Math.max(rec.firstSeenAt, rec.upgradedAt || 0) : now
+  const ageMs = Math.max(0, now - startAt)
+  const tierName = computeWarmupTierName(planDesc.kind, ageMs, wHours)
+  if (rec && rec.lastTier !== tierName) {
+    rec.lastTier = tierName
+    rec.updatedAt = now
+    dirty = true
+  }
+  if (dirty) saveAccountWarmup()
+
+  let limits
+  if (tierName.endsWith("-warmup-d1")) {
+    limits = { ...WARMUP_D1_LIMITS }
+  } else if (tierName.endsWith("-warmup-d2")) {
+    limits = { ...WARMUP_D2_LIMITS }
+  } else {
+    limits = rateGuardLimits(isUltra)
+  }
+
+  const proxyDesc = s ? resolveProxyForAccount(rtSalt || s.rt || "", s.who) : null
+  const proxyLabel = proxyDesc ? proxyDesc.masked : "direct"
+  const logKey = rtSalt || eHash || masked
+  if (accountWarmupState.loggedTiers.get(logKey) !== tierName) {
+    accountWarmupState.loggedTiers.set(logKey, tierName)
+    while (accountWarmupState.loggedTiers.size > 256) {
+      const oldest = accountWarmupState.loggedTiers.keys().next().value
+      if (oldest === undefined) break
+      accountWarmupState.loggedTiers.delete(oldest)
+    }
+    console.info(
+      `[antigravity] tier-guard active: account=${masked} tier=${tierName} limits=${limits.maxInflight}c/${limits.maxPer1m}m/${limits.maxPer5m}_5m/${limits.maxPerHour}h proxy=${proxyLabel}`,
+    )
+  }
+
+  return {
+    tier: tierName,
+    planKind: planDesc.kind,
+    isUltra,
+    ageMs,
+    firstSeenAt: rec?.firstSeenAt ?? now,
+    upgradedAt: rec?.upgradedAt ?? null,
+    proxy: proxyLabel,
+    ...limits,
+  }
+}
+
 function pruneRateTimestamps(arr, now) {
   const cutoff = now - RATE_WINDOW_1H_MS
   let idx = 0
@@ -1314,11 +2199,34 @@ function pruneRateTimestamps(arr, now) {
   return arr
 }
 
-function checkAndConsumeAccountRateLimit(s, now = Date.now(), projectInfo = null) {
+function consumeAccountRateTimestamp(s, now = Date.now()) {
+  if (!s?.rt || !isRateGuardEnabled()) return
+  const key = accountSalt(s) || s.rt
+  let arr = accountRateWindows.get(key)
+  if (!arr) {
+    arr = []
+    accountRateWindows.set(key, arr)
+  } else {
+    accountRateWindows.delete(key)
+    accountRateWindows.set(key, arr)
+  }
+  pruneRateTimestamps(arr, now)
+  arr.push(now)
+  if (accountRateWindows.size > MAX_BOUNDED_CACHE) {
+    pruneBoundedMap(accountRateWindows, MAX_BOUNDED_CACHE, (v, t) => {
+      if (!Array.isArray(v)) return true
+      pruneRateTimestamps(v, t)
+      return v.length === 0
+    })
+  }
+}
+
+function checkAndConsumeAccountRateLimit(s, now = Date.now(), projectInfo = null, opts = {}) {
   if (!s?.rt || !isRateGuardEnabled()) return { limited: false }
-  const ultra = isUltraAccount(s, projectInfo)
-  const { maxPerHour, maxPer5m, minCooldownMs, maxCooldownMs } = rateGuardLimits(ultra)
-  if (maxPerHour <= 0 && maxPer5m <= 0) return { limited: false }
+  const consume = opts?.consume !== false
+  const tierInfo = opts?.tierInfo ?? resolveAccountRateTier(s, now, projectInfo)
+  const { tier, maxPer1m, maxPer5m, maxPerHour, minCooldownMs, maxCooldownMs, proxy } = tierInfo
+  if (maxPer1m <= 0 && maxPer5m <= 0 && maxPerHour <= 0) return { limited: false, tier }
 
   const key = accountSalt(s) || s.rt
   let arr = accountRateWindows.get(key)
@@ -1339,6 +2247,14 @@ function checkAndConsumeAccountRateLimit(s, now = Date.now(), projectInfo = null
   }
 
   const count1h = arr.length
+  const cutoff1m = now - RATE_WINDOW_1M_MS
+  let first1mIdx = arr.length
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (arr[i] <= cutoff1m) break
+    first1mIdx = i
+  }
+  const count1m = arr.length - first1mIdx
+
   const cutoff5m = now - RATE_WINDOW_5M_MS
   let first5mIdx = arr.length
   for (let i = arr.length - 1; i >= 0; i--) {
@@ -1347,13 +2263,24 @@ function checkAndConsumeAccountRateLimit(s, now = Date.now(), projectInfo = null
   }
   const count5m = arr.length - first5mIdx
 
+  const hit1m = maxPer1m > 0 && count1m >= maxPer1m
   const hit5m = maxPer5m > 0 && count5m >= maxPer5m
   const hit1h = maxPerHour > 0 && count1h >= maxPerHour
-  if (!hit5m && !hit1h) {
-    arr.push(now)
-    return { limited: false, count1h: count1h + 1, count5m: count5m + 1 }
+  if (!hit1m && !hit5m && !hit1h) {
+    if (consume) arr.push(now)
+    return {
+      limited: false,
+      tier,
+      count1m: consume ? count1m + 1 : count1m,
+      count5m: consume ? count5m + 1 : count5m,
+      count1h: consume ? count1h + 1 : count1h,
+    }
   }
 
+  let wait1m = 0
+  if (hit1m && first1mIdx < arr.length) {
+    wait1m = arr[first1mIdx] + RATE_WINDOW_1M_MS - now
+  }
   let wait5m = 0
   if (hit5m && first5mIdx < arr.length) {
     wait5m = arr[first5mIdx] + RATE_WINDOW_5M_MS - now
@@ -1362,15 +2289,16 @@ function checkAndConsumeAccountRateLimit(s, now = Date.now(), projectInfo = null
   if (hit1h && arr.length > 0) {
     wait1h = arr[0] + RATE_WINDOW_1H_MS - now
   }
-  const rawWait = Math.max(wait5m, wait1h)
+  const rawWait = Math.max(wait1m, wait5m, wait1h)
   const cooldownMs = Math.min(maxCooldownMs, Math.max(minCooldownMs, rawWait))
   const retryAfterSec = Math.max(1, Math.ceil(cooldownMs / 1000))
   const masked = maskAccountId(s)
   const parts = []
+  if (hit1m) parts.push(`1m=${count1m}/${maxPer1m}`)
   if (hit5m) parts.push(`5m=${count5m}/${maxPer5m}`)
   if (hit1h) parts.push(`1h=${count1h}/${maxPerHour}`)
   const summary = parts.join(", ")
-  const message = `Antigravity: local soft rate limit reached for ${masked} (${summary}); yielding for ${retryAfterSec}s`
+  const message = `Antigravity: local soft rate limit reached for ${masked} (tier=${tier}, ${summary}); yielding for ${retryAfterSec}s`
 
   const acctKey = acctCooldownKey(s)
   const prev = cooldowns.get(acctKey)
@@ -1379,23 +2307,131 @@ function checkAndConsumeAccountRateLimit(s, now = Date.now(), projectInfo = null
       until: now + cooldownMs,
       status: 429,
       reason: "soft_rate_limit",
+      tier,
       message,
       strikes: (prev?.strikes ?? 0) + 1,
       persisted: false,
     })
     if (cooldowns.size > MAX_COOLDOWN_CACHE) pruneBoundedMap(cooldowns, MAX_COOLDOWN_CACHE, isCooldownExpired)
   }
-  console.warn(`[antigravity] soft-rate-guard yield: account=${masked} tier=${ultra ? "ultra" : "pro"} ${summary} cooldown=${retryAfterSec}s`)
+  console.warn(`[antigravity] soft-rate-guard yield: account=${masked} tier=${tier} ${summary} cooldown=${retryAfterSec}s proxy=${proxy}`)
   return {
     limited: true,
-    tier: ultra ? "ultra" : "pro",
+    tier,
     retryAfterSec,
     cooldownMs,
-    count1h,
+    count1m,
     count5m,
-    maxPerHour,
+    count1h,
+    maxPer1m,
     maxPer5m,
+    maxPerHour,
     message,
+  }
+}
+
+function pruneExpiredInflightLeases(set, now, ttlMs) {
+  if (!set) return 0
+  for (const lease of set) {
+    if (!lease || lease.released || now - lease.lastActivityAt >= ttlMs) {
+      if (lease && !lease.released) lease.released = true
+      set.delete(lease)
+    }
+  }
+  return set.size
+}
+
+function getAccountInflightCount(s, now = Date.now()) {
+  if (!s?.rt) return 0
+  const key = accountSalt(s) || s.rt
+  const set = accountInflightLeases.get(key)
+  if (!set) return 0
+  const count = pruneExpiredInflightLeases(set, now, inflightLeaseTtlMs())
+  if (count === 0) accountInflightLeases.delete(key)
+  return count
+}
+
+function acquireAccountInflight(s, tierInfoOrNow = null, nowArg = Date.now()) {
+  const now = typeof tierInfoOrNow === "number" ? tierInfoOrNow : nowArg
+  const tierInfo = isObj(tierInfoOrNow) ? tierInfoOrNow : resolveAccountRateTier(s, now, null)
+  const noopLease = { acquired: true, tier: tierInfo.tier, inflight: 0, maxInflight: tierInfo.maxInflight, touch: () => {}, release: () => {} }
+  if (!s?.rt || !isRateGuardEnabled()) return noopLease
+  const maxInflight = Number(tierInfo?.maxInflight) || 0
+  if (maxInflight <= 0) return noopLease
+
+  const key = accountSalt(s) || s.rt
+  let set = accountInflightLeases.get(key)
+  const ttlMs = inflightLeaseTtlMs()
+  if (set) {
+    pruneExpiredInflightLeases(set, now, ttlMs)
+    if (set.size === 0) {
+      accountInflightLeases.delete(key)
+      set = null
+    }
+  }
+  const current = set ? set.size : 0
+  if (current >= maxInflight) {
+    const masked = maskAccountId(s)
+    const message = `Antigravity: local concurrency cap reached for ${masked} (tier=${tierInfo.tier}, inflight=${current}/${maxInflight}); yielding for ${INFLIGHT_RETRY_AFTER_SEC}s`
+    console.warn(`[antigravity] inflight-guard yield: account=${masked} tier=${tierInfo.tier} inflight=${current}/${maxInflight} retryAfter=${INFLIGHT_RETRY_AFTER_SEC}s proxy=${tierInfo.proxy || "direct"}`)
+    return {
+      acquired: false,
+      tier: tierInfo.tier,
+      inflight: current,
+      maxInflight,
+      retryAfterSec: INFLIGHT_RETRY_AFTER_SEC,
+      message,
+    }
+  }
+  if (!set) {
+    set = new Set()
+    accountInflightLeases.set(key, set)
+  }
+  const lease = {
+    id: nextInflightLeaseId++,
+    acquiredAt: now,
+    lastActivityAt: now,
+    tier: tierInfo.tier,
+    released: false,
+    signalCleanup: null,
+  }
+  set.add(lease)
+  const touch = () => {
+    if (!lease.released) lease.lastActivityAt = Date.now()
+  }
+  const release = () => {
+    if (lease.released) return false
+    lease.released = true
+    if (typeof lease.signalCleanup === "function") {
+      try { lease.signalCleanup() } catch {}
+      lease.signalCleanup = null
+    }
+    const curSet = accountInflightLeases.get(key)
+    if (curSet) {
+      curSet.delete(lease)
+      if (curSet.size === 0) accountInflightLeases.delete(key)
+    }
+    return true
+  }
+  const attachSignal = (signal) => {
+    if (!signal || lease.released) return
+    const onAbort = () => release()
+    if (signal.aborted) {
+      release()
+      return
+    }
+    signal.addEventListener("abort", onAbort, { once: true })
+    lease.signalCleanup = () => signal.removeEventListener("abort", onAbort)
+  }
+  return {
+    acquired: true,
+    tier: tierInfo.tier,
+    inflight: set.size,
+    maxInflight,
+    lease,
+    touch,
+    release,
+    attachSignal,
   }
 }
 
@@ -1640,6 +2676,7 @@ function recordTimeoutCooldown(s, model, status, text) {
 
 // call is one of Code Assist's methods, its reply's JSON
 async function call(s, base, method, body, headers = {}, signal, opts = {}) {
+  rememberAccountIdentity(s)
   const globalCd = activeCooldown(GLOBAL_BREAKER_KEY)
   if (globalCd) throw new StatusError(globalCd.status, globalCd.message)
   const acctCd = activeCooldown(acctCooldownKey(s))
@@ -1719,6 +2756,7 @@ const LOAD_BODY = { metadata: { ideType: "ANTIGRAVITY" } }
 // resolveProject finds the project the account is served under, setting
 // the account up when Code Assist has none for it
 async function resolveProject(s, opts = {}) {
+  rememberAccountIdentity(s)
   let load, err
   try {
     load = await call(s, PROD, "loadCodeAssist", LOAD_BODY, {}, undefined, opts)
@@ -1731,6 +2769,7 @@ async function resolveProject(s, opts = {}) {
     if (err) return { id: s.project, plan: "", tier: "", paid: "", credits: false, at: Date.now() }
     const p = { id: s.project, plan: planOf(load), tier, paid, credits, at: Date.now() }
     evaluatePlanGuard(s, p)
+    resolveAccountRateTier(s, Date.now(), p)
     return p
   }
   if (err) throw err
@@ -1738,6 +2777,7 @@ async function resolveProject(s, opts = {}) {
   if (own) {
     const p = { id: own, plan: planOf(load), tier, paid, credits, at: Date.now() }
     evaluatePlanGuard(s, p)
+    resolveAccountRateTier(s, Date.now(), p)
     return p
   }
   const t = { ...defaultTier(load) }
@@ -1751,10 +2791,12 @@ async function resolveProject(s, opts = {}) {
   }
   const p = { id, plan: t.name ?? "", tier: t.id, paid, credits, at: Date.now() }
   evaluatePlanGuard(s, p)
+  resolveAccountRateTier(s, Date.now(), p)
   return p
 }
 
 async function project(s, forceRefresh = false, opts = {}) {
+  rememberAccountIdentity(s)
   let p = projects.get(s.rt)
   if (!p) {
     p = await resolveProject(s, opts)
@@ -1772,6 +2814,7 @@ async function project(s, forceRefresh = false, opts = {}) {
       p = { ...p, tier, paid, credits, plan: planOf(load) }
     }
     evaluatePlanGuard(s, p)
+    resolveAccountRateTier(s, Date.now(), p)
   } catch (e) {
     if (e instanceof SignedOut) throw e
   }
@@ -2119,6 +3162,7 @@ const lists = new Map() // refresh token → {at, infos, project, deprecated}
 
 // modelInfo reads the account's models, naming its tiers as the app does
 async function modelInfo(s, fresh = false) {
+  rememberAccountIdentity(s)
   const l = lists.get(s.rt)
   if (l && !fresh && Date.now() - l.at < MODELS_TTL && projects.has(s.rt)) return l
   const p = await project(s, fresh)
@@ -3205,8 +4249,6 @@ function firstUserText(req) {
   return first
 }
 
-const accountSalt = (s) => (s?.rt ? crypto.createHash("sha256").update(s.rt).digest("hex").slice(0, 16) : "")
-
 // sessionOf is the session id the app gives a conversation: from the host's
 // session header when named, else the conversation's first real user prompt,
 // isolated per Google account via acctSalt so two accounts never share IDs.
@@ -3399,7 +4441,7 @@ function showsAnswer(j) {
 // ({bad: true}). Once an answer has begun the client has it, and the
 // stream goes through as it is: a reply can't be taken back.
 const LATE = Symbol("late")
-function withIdleTimeout(body, idleMs = timeouts.streamIdleMs, onFinalize, onTimeout) {
+function withIdleTimeout(body, idleMs = timeouts.streamIdleMs, onFinalize, onTimeout, onActivity) {
   if (!body) {
     onFinalize?.()
     return body
@@ -3440,6 +4482,7 @@ function withIdleTimeout(body, idleMs = timeouts.streamIdleMs, onFinalize, onTim
           finish()
           ctl.close()
         } else {
+          try { onActivity?.() } catch {}
           ctl.enqueue(r.value)
         }
       } catch (e) {
@@ -3571,6 +4614,7 @@ async function holdThoughts(res, signal) {
 // complete sends a Gemini request at url (…/models/<id>:<method>) to
 // Antigravity for the account s
 async function complete(s, url, init, magpie) {
+  rememberAccountIdentity(s)
   reloadDynamicRules()
   pruneGlobalMaps()
   void syncRemoteRulesIfNeeded(false)
@@ -3644,234 +4688,243 @@ async function complete(s, url, init, magpie) {
     if (modelCd.status === 429) res.headers.set("Retry-After", String(modelCd.retryAfterSec))
     return res
   }
-  const rateLimit = checkAndConsumeAccountRateLimit(s, Date.now(), l?.project ?? projects.get(s.rt) ?? null)
+  const reqNow = Date.now()
+  const rateProj = l?.project ?? projects.get(s.rt) ?? null
+  const tierInfo = resolveAccountRateTier(s, reqNow, rateProj)
+  const rateLimit = checkAndConsumeAccountRateLimit(s, reqNow, rateProj, { consume: false, tierInfo })
   if (rateLimit.limited) {
     const res = errorResponse(429, rateLimit.message)
     res.headers.set("Retry-After", String(rateLimit.retryAfterSec))
     return res
   }
-  const system = systemText(raw)
-  const shapedSystem = outgoing(system)
-  const singleSysPart =
-    typeof raw.systemInstruction === "string" ||
-    (Array.isArray(raw.systemInstruction?.parts) &&
-      raw.systemInstruction.parts.length === 1 &&
-      typeof raw.systemInstruction.parts[0]?.text === "string")
-  const req = shape(raw, sent, at, effort, singleSysPart ? shapedSystem : undefined)
-  let tok
+  const inflightLease = acquireAccountInflight(s, tierInfo, reqNow)
+  if (!inflightLease.acquired) {
+    const res = errorResponse(429, inflightLease.message)
+    res.headers.set("Retry-After", String(inflightLease.retryAfterSec))
+    return res
+  }
+  consumeAccountRateTimestamp(s, reqNow)
+  let handoffToStream = false
   try {
-    tok = await token(s)
-  } catch (e) {
-    if (e instanceof SignedOut) return errorResponse(401, e.message, "expired")
-    return errorResponse(502, e.message ?? String(e))
-  }
-  const stream = method === "streamGenerateContent"
-  const ua = await userAgent()
-  const abortCleanups = new Set()
-  const cleanupAllAborts = () => {
-    for (const fn of abortCleanups) {
-      try {
-        fn()
-      } catch {}
-    }
-    abortCleanups.clear()
-  }
-  const deadlineAt = Date.now() + 55_000
-  const send = async (credits) => {
-    const rem = deadlineAt - Date.now()
-    if (rem < 1_000) {
-      return {
-        res: errorResponse(504, "antigravity upstream total deadline exceeded"),
-        cleanup: () => {},
-      }
-    }
-    const headerTimeoutMs = Math.min(timeouts.headerMs, Math.max(3_000, rem))
-    const ctl = new AbortController()
-    let headerTimedOut = false
-    let cleaned = false
-    const onExternalAbort = () => {
-      if (!ctl.signal.aborted) ctl.abort(init?.signal?.reason)
-    }
-    const cleanup = () => {
-      if (cleaned) return
-      cleaned = true
-      abortCleanups.delete(cleanup)
-      init?.signal?.removeEventListener("abort", onExternalAbort)
-    }
-    abortCleanups.add(cleanup)
-    if (init?.signal) {
-      if (init.signal.aborted) {
-        cleanup()
-        ctl.abort(init.signal.reason)
-      } else {
-        init.signal.addEventListener("abort", onExternalAbort, { once: true })
-      }
-    }
-    const headerTimer = setTimeout(() => {
-      headerTimedOut = true
-      if (!ctl.signal.aborted) ctl.abort(new StatusError(504, "antigravity upstream header timeout"))
-    }, headerTimeoutMs)
+    const system = systemText(raw)
+    const shapedSystem = outgoing(system)
+    const singleSysPart =
+      typeof raw.systemInstruction === "string" ||
+      (Array.isArray(raw.systemInstruction?.parts) &&
+        raw.systemInstruction.parts.length === 1 &&
+        typeof raw.systemInstruction.parts[0]?.text === "string")
+    const req = shape(raw, sent, at, effort, singleSysPart ? shapedSystem : undefined)
+    let tok
     try {
-      const streamSocketTimeoutMs = Math.max(STREAM_SOCKET_TIMEOUT_MS, timeouts.streamIdleMs + 15_000)
-      const res = await accountFetch(accountSalt(s) || s.rt, `${DAILY}/v1internal:streamGenerateContent?alt=sse`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: "Bearer " + tok, "User-Agent": ua },
-        body: JSON.stringify(envelope(req, sent, l.project.id, credits, init?.headers, accountSalt(s))),
-        signal: ctl.signal,
-        preHeaderTimeoutMs: Math.min(streamSocketTimeoutMs, headerTimeoutMs + 3_000),
-        streamSocketTimeoutMs,
-      })
-      clearTimeout(headerTimer)
-      return { res, cleanup }
+      tok = await token(s)
     } catch (e) {
-      clearTimeout(headerTimer)
-      cleanup()
-      if ((headerTimedOut || e?.code === "ETIMEDOUT") && !init?.signal?.aborted) {
+      if (e instanceof SignedOut) return errorResponse(401, e.message, "expired")
+      return errorResponse(502, e.message ?? String(e))
+    }
+    const stream = method === "streamGenerateContent"
+    const ua = await userAgent()
+    const abortCleanups = new Set()
+    const cleanupAllAborts = () => {
+      for (const fn of abortCleanups) {
+        try {
+          fn()
+        } catch {}
+      }
+      abortCleanups.clear()
+    }
+    const deadlineAt = Date.now() + 55_000
+    const send = async (credits) => {
+      const rem = deadlineAt - Date.now()
+      if (rem < 1_000) {
         return {
-          res: errorResponse(504, headerTimedOut ? "antigravity upstream header timeout" : (e?.message || "antigravity upstream socket timeout")),
+          res: errorResponse(504, "antigravity upstream total deadline exceeded"),
           cleanup: () => {},
         }
       }
-      throw e
-    }
-  }
-  const attempt = async () => {
-    let { res, cleanup } = await send(false)
-    let refusal
-    if (res.status === 429 && l.project.credits && usesCredits(magpie) && !allTurnsAway(shapedSystem)) {
-      if (deadlineAt - Date.now() < 5_000) {
-        return { res, refusal, cleanup }
+      const headerTimeoutMs = Math.min(timeouts.headerMs, Math.max(3_000, rem))
+      const ctl = new AbortController()
+      let headerTimedOut = false
+      let cleaned = false
+      const onExternalAbort = () => {
+        if (!ctl.signal.aborted) ctl.abort(init?.signal?.reason)
       }
-      // the plan's quota is used up: the app asks before it spends AI
-      // credits, and the switch is that answer. Credits are asked for only
-      // after a refusal, so a request the plan covers never spends one.
-      //
-      // The refusal is read before the second ask: when that ask fails too,
-      // the refusal is what the agent is told. Its body can't be read after
-      // it was cancelled ("Body already used", a 502 on every retry).
-      refusal = await res.text()
-      cleanup()
-      let again
+      const cleanup = () => {
+        if (cleaned) return
+        cleaned = true
+        abortCleanups.delete(cleanup)
+        init?.signal?.removeEventListener("abort", onExternalAbort)
+      }
+      abortCleanups.add(cleanup)
+      if (init?.signal) {
+        if (init.signal.aborted) {
+          cleanup()
+          ctl.abort(init.signal.reason)
+        } else {
+          init.signal.addEventListener("abort", onExternalAbort, { once: true })
+        }
+      }
+      const headerTimer = setTimeout(() => {
+        headerTimedOut = true
+        if (!ctl.signal.aborted) ctl.abort(new StatusError(504, "antigravity upstream header timeout"))
+      }, headerTimeoutMs)
       try {
-        again = await send(true)
+        const streamSocketTimeoutMs = Math.max(STREAM_SOCKET_TIMEOUT_MS, timeouts.streamIdleMs + 15_000)
+        const res = await accountFetch(accountSalt(s) || s.rt, `${DAILY}/v1internal:streamGenerateContent?alt=sse`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: "Bearer " + tok, "User-Agent": ua },
+          body: JSON.stringify(envelope(req, sent, l.project.id, credits, init?.headers, accountSalt(s))),
+          signal: ctl.signal,
+          preHeaderTimeoutMs: Math.min(streamSocketTimeoutMs, headerTimeoutMs + 3_000),
+          streamSocketTimeoutMs,
+        })
+        clearTimeout(headerTimer)
+        return { res, cleanup }
       } catch (e) {
-        if (init?.signal?.aborted) throw e
-      }
-      if (again?.res?.ok) {
-        res = again.res
-        cleanup = again.cleanup
-        refusal = undefined
-      } else {
-        await again?.res?.body?.cancel().catch(() => {})
-        again?.cleanup?.()
+        clearTimeout(headerTimer)
+        cleanup()
+        if ((headerTimedOut || e?.code === "ETIMEDOUT") && !init?.signal?.aborted) {
+          return {
+            res: errorResponse(504, headerTimedOut ? "antigravity upstream header timeout" : (e?.message || "antigravity upstream socket timeout")),
+            cleanup: () => {},
+          }
+        }
+        throw e
       }
     }
-    return { res, refusal, cleanup }
-  }
-  // Gemini 4 now and then fails a request the same request later passes:
-  // its backend rejects a call the model built itself (a 400
-  // INVALID_ARGUMENT after the model ran, or in the stream after thinking).
-  // Such a reply is asked again, up to RETRY_BAD_CALL times. A 400 that
-  // comes back fast is the request's own fault and is returned as it is.
-  const again400 = isGemini4(sent) || isGemini4(model)
-  let res, refusal, activeCleanup
-  // asks is how many times the model was asked; slow, whether the last
-  // 400 took long enough to be the model's own (retry400.floorMs)
-  let asks = 0
-  let slow = false
-  let lastElapsedMs = 0
-  try {
-    for (let n = 0; ; n++) {
-      const t0 = Date.now()
-      ;({ res, refusal, cleanup: activeCleanup } = await attempt())
-      lastElapsedMs = Date.now() - t0
-      asks = n + 1
-      slow = lastElapsedMs >= retry400.floorMs
-      const left = again400 && n < RETRY_BAD_CALL && !init?.signal?.aborted
-      if (!left) break
-      if (!res.ok) {
-        if (res.status !== 400) break
-        const text = refusal ?? (await res.text())
-        activeCleanup?.()
-        refusal = text
-        if (!badCall(text) || !slow || deadlineAt - Date.now() < 5_000) break
-        await sleep(retry400.pauseMs)
-        continue
-      }
-      const held = await holdThoughts(res, init?.signal)
-      if (held.timeout) {
-        activeCleanup?.()
-        res = errorResponse(504, "antigravity upstream stream silent timeout")
-        refusal = undefined
-        break
-      }
-      if (held.bad) {
-        activeCleanup?.()
+    const attempt = async () => {
+      let { res, cleanup } = await send(false)
+      let refusal
+      if (res.status === 429 && l.project.credits && usesCredits(magpie) && !allTurnsAway(shapedSystem)) {
         if (deadlineAt - Date.now() < 5_000) {
-          res = errorResponse(504, "antigravity upstream retry budget exhausted")
+          return { res, refusal, cleanup }
+        }
+        refusal = await res.text()
+        cleanup()
+        let again
+        try {
+          again = await send(true)
+        } catch (e) {
+          if (init?.signal?.aborted) throw e
+        }
+        if (again?.res?.ok) {
+          res = again.res
+          cleanup = again.cleanup
+          refusal = undefined
+        } else {
+          await again?.res?.body?.cancel().catch(() => {})
+          again?.cleanup?.()
+        }
+      }
+      return { res, refusal, cleanup }
+    }
+    const again400 = isGemini4(sent) || isGemini4(model)
+    let res, refusal, activeCleanup
+    let asks = 0
+    let slow = false
+    let lastElapsedMs = 0
+    try {
+      for (let n = 0; ; n++) {
+        const t0 = Date.now()
+        ;({ res, refusal, cleanup: activeCleanup } = await attempt())
+        lastElapsedMs = Date.now() - t0
+        asks = n + 1
+        slow = lastElapsedMs >= retry400.floorMs
+        const left = again400 && n < RETRY_BAD_CALL && !init?.signal?.aborted
+        if (!left) break
+        if (!res.ok) {
+          if (res.status !== 400) break
+          const text = refusal ?? (await res.text())
+          activeCleanup?.()
+          refusal = text
+          if (!badCall(text) || !slow || deadlineAt - Date.now() < 5_000) break
+          await sleep(retry400.pauseMs)
+          continue
+        }
+        const held = await holdThoughts(res, init?.signal)
+        if (held.timeout) {
+          activeCleanup?.()
+          res = errorResponse(504, "antigravity upstream stream silent timeout")
           refusal = undefined
           break
         }
-        await sleep(retry400.pauseMs)
-        continue
+        if (held.bad) {
+          activeCleanup?.()
+          if (deadlineAt - Date.now() < 5_000) {
+            res = errorResponse(504, "antigravity upstream retry budget exhausted")
+            refusal = undefined
+            break
+          }
+          await sleep(retry400.pauseMs)
+          continue
+        }
+        res = new Response(held.body, { status: 200, headers: res.headers })
+        break
       }
-      res = new Response(held.body, { status: 200, headers: res.headers })
-      break
-    }
-    if (!res.ok) {
-      const text = refusal ?? (await res.text())
-      activeCleanup?.()
-      const msg = apiError(text, res.status)
-      if (again400 && res.status === 400 && slow && badCall(text)) return errorResponse(400, badCallSaid(sent, asks)(msg))
-      if (res.status === 401) {
-        tokens.delete(s.rt)
-        return errorResponse(401, `Antigravity: ${msg}`, "kept")
+      if (!res.ok) {
+        const text = refusal ?? (await res.text())
+        activeCleanup?.()
+        const msg = apiError(text, res.status)
+        if (again400 && res.status === 400 && slow && badCall(text)) return errorResponse(400, badCallSaid(sent, asks)(msg))
+        if (res.status === 401) {
+          tokens.delete(s.rt)
+          return errorResponse(401, `Antigravity: ${msg}`, "kept")
+        }
+        if (res.status === 404) return errorResponse(404, `model ${sent} not found`)
+        if (res.status === 429 && /resource has been exhausted/i.test(text) && allTurnsAway(shapedSystem)) {
+          return errorResponse(400, `Antigravity answered 429 to this system prompt: ${msg} — ${hint(shapedSystem)}`)
+        }
+        if (isTransientTimeout(res.status, text)) {
+          recordTimeoutCooldown(s, sent, res.status, text)
+          return errorResponse(res.status === 502 ? 502 : 504, `Antigravity: ${msg}`)
+        }
+        let failureInfo
+        if (res.status === 403 || res.status === 429 || res.status === 503) {
+          failureInfo = recordUpstreamFailure(s, sent, res.status, res.headers, text, {
+            elapsedMs: lastElapsedMs,
+            rawSystem: system,
+            shapedSystem,
+            firstUser: firstUserText(raw),
+          })
+        }
+        if (res.status === 429 && l.project.credits && !usesCredits(magpie)) {
+          const left = await quotaLeft(s, sent)
+          const note = left > 0 ? quotaLeftNote(left) : CREDITS_NOTE
+          return new Response(withNote(text, note), { status: 429, headers: { "content-type": "application/json" } })
+        }
+        const resHeaders = { "content-type": res.headers.get("content-type") ?? "application/json" }
+        return new Response(text, { status: res.status, headers: resHeaders })
       }
-      if (res.status === 404) return errorResponse(404, `model ${sent} not found`)
-      if (res.status === 429 && /resource has been exhausted/i.test(text) && allTurnsAway(shapedSystem)) {
-        // the system prompt turned away, not a quota: a 400 the next member
-        // of a group is asked after, and the agent doesn't retry. It says
-        // what Antigravity answered (a 429), not that this is a channel
-        return errorResponse(400, `Antigravity answered 429 to this system prompt: ${msg} — ${hint(shapedSystem)}`)
+      clearModelCooldown(s, sent)
+      const timedBody = withIdleTimeout(
+        res.body,
+        timeouts.streamIdleMs,
+        () => {
+          activeCleanup?.()
+          inflightLease.release()
+        },
+        (err) => {
+          recordTimeoutCooldown(s, sent, 504, err?.message ?? "antigravity upstream stream idle timeout")
+        },
+        () => inflightLease.touch(),
+      )
+      if (stream) {
+        inflightLease.attachSignal?.(init?.signal)
+        const outBody = unwrap(timedBody, again400 ? badCallSaid(sent, asks) : undefined)
+        handoffToStream = true
+        return new Response(outBody, { status: 200, headers: RESPONSE_HEADERS })
       }
-      if (isTransientTimeout(res.status, text)) {
-        recordTimeoutCooldown(s, sent, res.status, text)
-        return errorResponse(res.status === 502 ? 502 : 504, `Antigravity: ${msg}`)
+      try {
+        return new Response(JSON.stringify(await whole(new Response(timedBody, { status: 200, headers: res.headers }))), { status: 200, headers: { "content-type": "application/json" } })
+      } catch (e) {
+        if (e instanceof StatusError) return errorResponse(e.status || 504, e.message)
+        throw e
       }
-      let failureInfo
-      if (res.status === 403 || res.status === 429 || res.status === 503) {
-        failureInfo = recordUpstreamFailure(s, sent, res.status, res.headers, text, {
-          elapsedMs: lastElapsedMs,
-          rawSystem: system,
-          shapedSystem,
-          firstUser: firstUserText(raw),
-        })
-      }
-      if (res.status === 429 && l.project.credits && !usesCredits(magpie)) {
-        // the credits note only where the model's quota may be what ran
-        // out: a 429 with quota left is something else, and credits would
-        // not change it (plugins#1148)
-        const left = await quotaLeft(s, sent)
-        const note = left > 0 ? quotaLeftNote(left) : CREDITS_NOTE
-        return new Response(withNote(text, note), { status: 429, headers: { "content-type": "application/json" } })
-      }
-      const resHeaders = { "content-type": res.headers.get("content-type") ?? "application/json" }
-      return new Response(text, { status: res.status, headers: resHeaders })
-    }
-    clearModelCooldown(s, sent)
-    const timedBody = withIdleTimeout(res.body, timeouts.streamIdleMs, activeCleanup, (err) => {
-      recordTimeoutCooldown(s, sent, 504, err?.message ?? "antigravity upstream stream idle timeout")
-    })
-    if (stream) return new Response(unwrap(timedBody, again400 ? badCallSaid(sent, asks) : undefined), { status: 200, headers: RESPONSE_HEADERS })
-    try {
-      return new Response(JSON.stringify(await whole(new Response(timedBody, { status: 200, headers: res.headers }))), { status: 200, headers: { "content-type": "application/json" } })
     } catch (e) {
-      if (e instanceof StatusError) return errorResponse(e.status || 504, e.message)
+      cleanupAllAborts()
       throw e
     }
-  } catch (e) {
-    cleanupAllAborts()
-    throw e
+  } finally {
+    if (!handoffToStream) inflightLease.release()
   }
 }
 
@@ -4122,6 +5175,7 @@ async function usage(auth) {
   reloadDynamicRules()
   const s = stateOf(auth)
   if (!s) return { error: "no such Antigravity account", signIn: "kept" }
+  rememberAccountIdentity(s)
   const acctCd = activeCooldown(acctCooldownKey(s))
   if (acctCd?.reason === "plan_downgraded") {
     if (!isPlanGuardEnabled() || isFreeEmailWhitelisted(s.who)) {
@@ -4190,6 +5244,7 @@ const b64url = (b) => b.toString("base64").replace(/\+/g, "-").replace(/\//g, "_
 // sign-in to keep: the account's email, its project found or set up
 async function signedIn(rt, access, expires, projectID, email) {
   const s = { rt, project: projectID ?? "", access: access ?? "", expires: expires ?? 0, who: email ?? "" }
+  rememberAccountIdentity(s)
   const hadDeadCd = cooldowns.delete(acctCooldownKey(s))
   if (hadDeadCd) savePersistentCooldowns()
   if (!access) {
@@ -4204,6 +5259,7 @@ async function signedIn(rt, access, expires, projectID, email) {
     if (!email) throw new Error("Google didn't say whose account this is")
   }
   s.who = email
+  rememberAccountIdentity(s)
   // the project, found now so requests don't wait on it; a sign-in is kept
   // without one, found again on the first request
   try {
@@ -4440,6 +5496,7 @@ async function webSearch({ query, count } = {}, ctx = {}) {
   if (!q) throw new Error("query is required")
   const s = stateOf(await ctx.getAuth?.())
   if (!s) throw new Error("not signed in to Antigravity")
+  rememberAccountIdentity(s)
   const acctCd = activeCooldown(GLOBAL_BREAKER_KEY) ?? activeCooldown(acctCooldownKey(s))
   if (acctCd) {
     if (acctCd.reason === "plan_downgraded" && (!isPlanGuardEnabled() || isFreeEmailWhitelisted(s.who))) {
@@ -4504,6 +5561,7 @@ async function webSearch({ query, count } = {}, ctx = {}) {
 // ---- the plugin ---------------------------------------------------------------------------
 
 export async function AntigravityAuthPlugin({ client, magpie } = {}) {
+  try { seedWarmupFromLogins() } catch {}
   void syncRemoteRulesIfNeeded(false)
   return {
     async "chat.headers"(input, output) {
@@ -4691,16 +5749,31 @@ export const _internal = {
   tokenInFlight,
   signedIn,
   LOGINS_PATH,
+  PROXIES_PATH,
+  WARMUP_PATH,
   PLAN_GUARD_DEFAULT_COOLDOWN_MS,
   PLAN_GUARD_PROBE_INTERVAL_MS,
   PLAN_GUARD_ALERT_DEDUP_MS,
-  DEFAULT_MAX_REQ_PER_HOUR,
+  DEFAULT_MAX_INFLIGHT,
+  DEFAULT_MAX_REQ_PER_1M,
   DEFAULT_MAX_REQ_PER_5M,
-  DEFAULT_ULTRA_MAX_REQ_PER_HOUR,
+  DEFAULT_MAX_REQ_PER_HOUR,
+  DEFAULT_ULTRA_MAX_INFLIGHT,
+  DEFAULT_ULTRA_MAX_REQ_PER_1M,
   DEFAULT_ULTRA_MAX_REQ_PER_5M,
+  DEFAULT_ULTRA_MAX_REQ_PER_HOUR,
+  DEFAULT_WARMUP_HOURS,
+  WARMUP_D1_LIMITS,
+  WARMUP_D2_LIMITS,
+  INFLIGHT_RETRY_AFTER_SEC,
+  RATE_WINDOW_1M_MS,
   RATE_WINDOW_5M_MS,
   RATE_WINDOW_1H_MS,
   accountRateWindows,
+  accountInflightLeases,
+  accountWarmupState,
+  accountProxiesState,
+  accountEmailsByKey,
   planDowngradeAlerts,
   loginsPlanCache,
   isPlanGuardEnabled,
@@ -4711,12 +5784,28 @@ export const _internal = {
   isUltraAccount,
   rateGuardLimits,
   maskAccountId,
+  maskProxyUrl,
+  parseProxyDescriptor,
+  reloadAccountProxies,
+  rememberAccountIdentity,
+  resolveProxyForAccount,
   readLoginsPlan,
+  readLoginsEntry,
+  readAllLoginsEntries,
   classifyAccountPlan,
+  classifyPlanKind,
   recordPlanDowngradeCooldown,
   clearPlanDowngradeCooldown,
   evaluatePlanGuard,
+  reloadAccountWarmup,
+  saveAccountWarmup,
+  seedWarmupFromLogins,
+  markAccountUpgraded,
+  resolveAccountRateTier,
   checkAndConsumeAccountRateLimit,
+  consumeAccountRateTimestamp,
+  acquireAccountInflight,
+  getAccountInflightCount,
   pruneRateTimestamps,
   project,
   modelInfo,

@@ -23,10 +23,19 @@
 4. **Plan Guard（降级/免费号防送死门禁）**
    - 自动识别 `loadCodeAssist` 与 `logins.json` 中的套餐状态：正常放行 `Google AI Pro` / `Google AI Ultra` 以及无法明确判断的 `unknown` 账号（宁放不误杀）；一旦确认为 `Antigravity Starter Quota` / `free-tier`（无 `paidTier`）等降级免费号，立即阻止向 Google 发起上游推理请求，并对其施加 6 小时单号隔离冷却（`reason: "plan_downgraded"`，返回 `429 + Retry-After` 触发 Magpie 自动切换至其他 Pro 账号或 `ai-studio`，绝不触发全局连环刹车），同时在 `rule-alerts.jsonl` 去重记录一次告警。
    - 支持通过 `AG_PLAN_GUARD_ENABLED`、`AG_ALLOW_FREE_EMAILS`（逗号分隔白名单）、`AG_PLAN_GUARD_COOLDOWN_MS` 或 `dynamic-rules.json` 的 `planGuard` 字段热配置；当账号续费恢复 Pro/Ultra 后，支持通过低频探测（10 分钟节流）、冷却到期自动重探或重登无感自愈解除隔离。
-5. **Per-Account Rate/Hourly Soft Guard（单号滑窗软限流保护）**
-   - 仅统计各账号真实推理请求（`generateContent` / `streamGenerateContent`；`countTokens`、`models`、`usage` 不计入），默认双滑窗阈值按账号套餐自动分档：Pro 账号 `200` 次/60 分钟（`AG_MAX_REQ_PER_HOUR`）与 `45` 次/5 分钟（`AG_MAX_REQ_PER_5M`）；**Google AI Ultra (`g1-ultra-tier`) 账号自动提档至 `600` 次/60 分钟（`AG_ULTRA_MAX_REQ_PER_HOUR`）与 `150` 次/5 分钟（`AG_ULTRA_MAX_REQ_PER_5M`）**，且软冷却上限更温和（60s）。
-   - 触发阈值时仅在内存实施 15 秒–5 分钟软退避（`429 + Retry-After`，`reason: "soft_rate_limit"`，不写 `cooldowns.json`、不写 `rule-alerts.jsonl`、不触发全局熔断），让 Magpie 平滑把流量切分至其余健康 Pro 账号。
-6. **开箱即用 · 云端词库自动热同步**
+5. **4 维防脉冲与并发硬闸 + 48h 阶梯养号保护（v2026-11-26）**
+   - **4 维联合闸门**（仅统计 `generateContent` / `streamGenerateContent` 实际推理请求，超限一律返回 `429 + Retry-After` 纯内存平滑让位，绝不写 `cooldowns.json`、绝不写 `rule-alerts.jsonl`、绝不触发 `global:breaker`）：
+     - **单号并发硬闸 (`maxInflight`)**：超限直接返回 `429 + Retry-After: 5` 将并发子代理打散给其他号或备用通道；流式 SSE 结束/报错/取消/中断或超过租约 TTL 自动释放，绝不泄漏。
+     - **1 分钟防脉冲 + 5 分钟 / 60 分钟滑窗**：彻底消灭短时高频脉冲特征。
+   - **48 小时阶梯养号期 (`AG_WARMUP_HOURS=48`)**：
+     - 持久化在 `account-warmup.json`（脱敏 hash、`0600` 权限）；基于 `logins.json` `seen` 时间自动豁免运行超过 48 小时的成熟老号，而新登录账号或从 `free/starter` 刚升级为 `pro/ultra` 的账号自动进入 48 小时爬坡保护：
+       - `d1`（0–24h）：`1c / 4/1m / 12/5m / 45/1h`，软冷却 `45s–180s`
+       - `d2`（24–48h）：`1c / 6/1m / 22/5m / 90/1h`，软冷却 `30s–150s`
+       - `pro-mature`（>48h）：`2c / 8/1m / 30/5m / 120/1h`，软冷却 `15s–300s`
+       - `ultra-mature`（>48h）：`2c / 10/1m / 40/5m / 180/1h`，软冷却 `30s–180s`
+6. **单号独立代理物理隔离（Per-Account Proxy Isolation）**
+   - 读取插件目录下 `account-proxies.json`（按 mtime 每 10 秒热加载，支持 `http://`、`https://`、`socks5://`、`socks5h://` 及账密认证），将 OAuth 刷新（`oauth2.googleapis.com`）与 Code Assist（`cloudcode-pa.googleapis.com` / `daily-cloudcode-pa.googleapis.com`）全链路绑定至该账号专属代理连接池，严禁回落直连；切换代理 URL 时自动销毁旧连接池并重建，日志严格脱敏（仅输出 `proxy=http://host:port` 或 `proxy=direct`）。
+7. **开箱即用 · 云端词库自动热同步**
    - 无需安装额外外部脚本或 systemd 定时任务！
    - 插件启动后每 **30 分钟** 在后台非阻塞异步检查一次最新词库（5 秒超时，静默容错绝不影响正常对话），遇到疑似新风控 429 时也会立即后台拉取更新并热生效。
    - 全部状态文件均基于当前插件目录动态解析，100% 兼容 **Windows / macOS / Linux 桌面版与 Docker 版**（只读目录下也可纯内存热生效）。
@@ -83,17 +92,37 @@ magpie plugin update
 | `AG_PLAN_GUARD_ENABLED` | `true` | 是否开启降级/免费号隔离门禁（设为 `false` / `0` 关闭） |
 | `AG_ALLOW_FREE_EMAILS` | 空 | 逗号分隔免费号白名单邮箱，命中账号直接放行 |
 | `AG_PLAN_GUARD_COOLDOWN_MS` | `21600000` (6h) | 降级号单号冷却时长（毫秒） |
-| `AG_RATE_GUARD_ENABLED` | `true` | 是否开启单号滑窗软限流 |
-| `AG_MAX_REQ_PER_HOUR` | `200` | 单号 60 分钟推理请求软上限 |
-| `AG_MAX_REQ_PER_5M` | `45` | 单号 5 分钟突发推理请求软上限 |
-| `AG_RATE_COOLDOWN_MIN_MS` | `15000` | 软限流最小冷却（毫秒） |
-| `AG_RATE_COOLDOWN_MAX_MS` | `300000` | 软限流最大冷却（毫秒） |
-| `AG_ULTRA_MAX_REQ_PER_HOUR` | `600` | Ultra 账号 60 分钟推理请求软上限 |
-| `AG_ULTRA_MAX_REQ_PER_5M` | `150` | Ultra 账号 5 分钟突发推理请求软上限 |
-| `AG_ULTRA_RATE_COOLDOWN_MIN_MS` | `15000` | Ultra 账号软限流最小冷却（毫秒） |
-| `AG_ULTRA_RATE_COOLDOWN_MAX_MS` | `60000` | Ultra 账号软限流最大冷却（毫秒） |
+| `AG_RATE_GUARD_ENABLED` | `true` | 是否开启单号 4 维并发与滑窗软限流 |
+| `AG_WARMUP_HOURS` | `48` | 新号/新升级账号阶梯养号保护时长（小时） |
+| `AG_MAX_INFLIGHT` | `2` | 成熟 Pro 账号单号最大并发数 |
+| `AG_MAX_REQ_PER_1M` | `8` | 成熟 Pro 账号 1 分钟脉冲上限 |
+| `AG_MAX_REQ_PER_5M` | `30` | 成熟 Pro 账号 5 分钟推理请求软上限 |
+| `AG_MAX_REQ_PER_HOUR` | `120` | 成熟 Pro 账号 60 分钟推理请求软上限 |
+| `AG_RATE_COOLDOWN_MIN_MS` | `15000` | Pro 软限流最小冷却（毫秒） |
+| `AG_RATE_COOLDOWN_MAX_MS` | `300000` | Pro 软限流最大冷却（毫秒） |
+| `AG_ULTRA_MAX_INFLIGHT` | `2` | 成熟 Ultra 账号单号最大并发数 |
+| `AG_ULTRA_MAX_REQ_PER_1M` | `10` | 成熟 Ultra 账号 1 分钟脉冲上限 |
+| `AG_ULTRA_MAX_REQ_PER_5M` | `40` | 成熟 Ultra 账号 5 分钟推理请求软上限 |
+| `AG_ULTRA_MAX_REQ_PER_HOUR` | `180` | 成熟 Ultra 账号 60 分钟推理请求软上限 |
+| `AG_ULTRA_RATE_COOLDOWN_MIN_MS` | `30000` | Ultra 账号软限流最小冷却（毫秒） |
+| `AG_ULTRA_RATE_COOLDOWN_MAX_MS` | `180000` | Ultra 账号软限流最大冷却（毫秒） |
+| `MAGPIE_AG_PROXIES_PATH` | `<plugin>/account-proxies.json` | 单号独立代理配置文件路径（10s 热加载） |
+| `MAGPIE_AG_WARMUP_PATH` | `<plugin>/account-warmup.json` | 养号状态持久化文件路径 |
 
 *(也支持在 `dynamic-rules.json` 的 `planGuard` 对象中热配置 `{ "enabled": true, "allowFreeEmails": [], "cooldownMs": 0 }`。)*
+
+### 单号独立代理绑定（`account-proxies.json`）
+
+在插件目录下编辑 `account-proxies.json`（权限 `0600`，10 秒内自动热生效，无需重启）：
+
+```json
+{
+  "default": null,
+  "accounts": {
+    "user@example.com": "http://user:pass@proxy-host:port"
+  }
+}
+```
 
 ---
 
