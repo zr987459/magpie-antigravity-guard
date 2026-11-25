@@ -24,7 +24,7 @@
    - 自动识别 `loadCodeAssist` 与 `logins.json` 中的套餐状态：正常放行 `Google AI Pro` / `Google AI Ultra` 以及无法明确判断的 `unknown` 账号（宁放不误杀）；一旦确认为 `Antigravity Starter Quota` / `free-tier`（无 `paidTier`）等降级免费号，立即阻止向 Google 发起上游推理请求，并对其施加 6 小时单号隔离冷却（`reason: "plan_downgraded"`，返回 `429 + Retry-After` 触发 Magpie 自动切换至其他 Pro 账号或 `ai-studio`，绝不触发全局连环刹车），同时在 `rule-alerts.jsonl` 去重记录一次告警。
    - 支持通过 `AG_PLAN_GUARD_ENABLED`、`AG_ALLOW_FREE_EMAILS`（逗号分隔白名单）、`AG_PLAN_GUARD_COOLDOWN_MS` 或 `dynamic-rules.json` 的 `planGuard` 字段热配置；当账号续费恢复 Pro/Ultra 后，支持通过低频探测（10 分钟节流）、冷却到期自动重探或重登无感自愈解除隔离。
 5. **Per-Account Rate/Hourly Soft Guard（单号滑窗软限流保护）**
-   - 仅统计各账号真实推理请求（`generateContent` / `streamGenerateContent`；`countTokens`、`models`、`usage` 不计入），默认双滑窗阈值：`200` 次/60 分钟（`AG_MAX_REQ_PER_HOUR`）与 `45` 次/5 分钟（`AG_MAX_REQ_PER_5M`）。
+   - 仅统计各账号真实推理请求（`generateContent` / `streamGenerateContent`；`countTokens`、`models`、`usage` 不计入），默认双滑窗阈值按账号套餐自动分档：Pro 账号 `200` 次/60 分钟（`AG_MAX_REQ_PER_HOUR`）与 `45` 次/5 分钟（`AG_MAX_REQ_PER_5M`）；**Google AI Ultra (`g1-ultra-tier`) 账号自动提档至 `600` 次/60 分钟（`AG_ULTRA_MAX_REQ_PER_HOUR`）与 `150` 次/5 分钟（`AG_ULTRA_MAX_REQ_PER_5M`）**，且软冷却上限更温和（60s）。
    - 触发阈值时仅在内存实施 15 秒–5 分钟软退避（`429 + Retry-After`，`reason: "soft_rate_limit"`，不写 `cooldowns.json`、不写 `rule-alerts.jsonl`、不触发全局熔断），让 Magpie 平滑把流量切分至其余健康 Pro 账号。
 6. **开箱即用 · 云端词库自动热同步**
    - 无需安装额外外部脚本或 systemd 定时任务！
@@ -88,6 +88,10 @@ magpie plugin update
 | `AG_MAX_REQ_PER_5M` | `45` | 单号 5 分钟突发推理请求软上限 |
 | `AG_RATE_COOLDOWN_MIN_MS` | `15000` | 软限流最小冷却（毫秒） |
 | `AG_RATE_COOLDOWN_MAX_MS` | `300000` | 软限流最大冷却（毫秒） |
+| `AG_ULTRA_MAX_REQ_PER_HOUR` | `600` | Ultra 账号 60 分钟推理请求软上限 |
+| `AG_ULTRA_MAX_REQ_PER_5M` | `150` | Ultra 账号 5 分钟突发推理请求软上限 |
+| `AG_ULTRA_RATE_COOLDOWN_MIN_MS` | `15000` | Ultra 账号软限流最小冷却（毫秒） |
+| `AG_ULTRA_RATE_COOLDOWN_MAX_MS` | `60000` | Ultra 账号软限流最大冷却（毫秒） |
 
 *(也支持在 `dynamic-rules.json` 的 `planGuard` 对象中热配置 `{ "enabled": true, "allowFreeEmails": [], "cooldownMs": 0 }`。)*
 

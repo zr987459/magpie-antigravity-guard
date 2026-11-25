@@ -100,6 +100,10 @@ function resetAll() {
   delete process.env.AG_RATE_GUARD_ENABLED
   delete process.env.AG_MAX_REQ_PER_HOUR
   delete process.env.AG_MAX_REQ_PER_5M
+  delete process.env.AG_ULTRA_MAX_REQ_PER_HOUR
+  delete process.env.AG_ULTRA_MAX_REQ_PER_5M
+  delete process.env.AG_ULTRA_RATE_COOLDOWN_MIN_MS
+  delete process.env.AG_ULTRA_RATE_COOLDOWN_MAX_MS
   delete process.env.AG_RATE_COOLDOWN_MIN_MS
   delete process.env.AG_RATE_COOLDOWN_MAX_MS
 }
@@ -316,6 +320,42 @@ try {
   _internal.accountRateWindows.set(keyA, [now - 61 * 60_000]) // expired out of 1h window
   const rRecovered = await _internal.complete(sA, url, makeReqInit())
   assert.equal(rRecovered.status, 200, "Account must recover automatically once window slides")
+
+  // =========================================================================
+  // 5. Ultra Tier Soft Rate Guard Scaling (Google AI Ultra / g1-ultra-tier)
+  // =========================================================================
+  resetAll()
+  planByToken["tok-ultra"] = { currentTier: { id: "free-tier", name: "Antigravity" }, paidTier: { id: "g1-ultra-tier", name: "Google AI Ultra" } }
+  const sUltraRate = { rt: "rt-rate-ultra", project: "proj-ultra", access: "tok-ultra", expires: Date.now() + 3600_000, who: "ultra@example.com" }
+
+  assert.equal(_internal.isUltraAccount(sUltraRate, { plan: "Google AI Ultra", tier: "free-tier", paid: "g1-ultra-tier" }), true)
+  assert.equal(_internal.isUltraAccount(sA, { plan: "Google AI Pro", tier: "free-tier", paid: "g1-pro-tier" }), false)
+
+  const proLimits = _internal.rateGuardLimits(false)
+  const ultraLimits = _internal.rateGuardLimits(true)
+  assert.equal(proLimits.maxPerHour, 200)
+  assert.equal(proLimits.maxPer5m, 45)
+  assert.equal(ultraLimits.maxPerHour, 600)
+  assert.equal(ultraLimits.maxPer5m, 150)
+  assert.equal(ultraLimits.maxCooldownMs, 60_000)
+
+  // Ultra account survives 50 burst requests (which would exceed Pro 45/5m cap) without triggering rate guard
+  for (let i = 0; i < 50; i++) {
+    const res = await _internal.complete(sUltraRate, url, makeReqInit())
+    assert.equal(res.status, 200, `Ultra request #${i + 1} (> Pro 45/5m) should pass`)
+  }
+  assert.equal(_internal.cooldowns.has(`acct:${sUltraRate.rt}`), false)
+
+  // Custom AG_ULTRA_MAX_REQ_PER_5M override + gentler 60s max cooldown
+  process.env.AG_ULTRA_MAX_REQ_PER_5M = "52"
+  process.env.AG_ULTRA_MAX_REQ_PER_HOUR = "600"
+  for (let i = 0; i < 2; i++) {
+    assert.equal((await _internal.complete(sUltraRate, url, makeReqInit())).status, 200)
+  }
+  const rUltraBurst = await _internal.complete(sUltraRate, url, makeReqInit())
+  assert.equal(rUltraBurst.status, 429)
+  const ultraRetry = Number(rUltraBurst.headers.get("retry-after"))
+  assert.ok(ultraRetry >= 15 && ultraRetry <= 60, `Ultra soft cooldown should be 15..60s, got ${ultraRetry}s`)
 
   console.log("AG_PLAN_AND_RATE_GUARD_TESTS_OK")
 } finally {

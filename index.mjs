@@ -906,6 +906,11 @@ const DEFAULT_MAX_REQ_PER_HOUR = 200
 const DEFAULT_MAX_REQ_PER_5M = 45
 const DEFAULT_RATE_COOLDOWN_MIN_MS = 15 * 1000
 const DEFAULT_RATE_COOLDOWN_MAX_MS = 5 * 60 * 1000
+const DEFAULT_ULTRA_MAX_REQ_PER_HOUR = 600
+const DEFAULT_ULTRA_MAX_REQ_PER_5M = 150
+const DEFAULT_ULTRA_RATE_COOLDOWN_MIN_MS = 15 * 1000
+const DEFAULT_ULTRA_RATE_COOLDOWN_MAX_MS = 60 * 1000
+const ULTRA_PLAN_RE = /\b(?:ultra|g1-ultra-tier)\b/i
 
 const accountRateWindows = new Map() // acctKey -> number[] (epoch ms timestamps)
 const planDowngradeAlerts = new Map() // acctKey -> lastAlertAt ms
@@ -977,13 +982,30 @@ function isRateGuardEnabled() {
   return envVal !== undefined ? envVal : true
 }
 
-function rateGuardLimits() {
-  const maxPerHour = parseNonNegIntEnv("AG_MAX_REQ_PER_HOUR", DEFAULT_MAX_REQ_PER_HOUR)
-  const maxPer5m = parseNonNegIntEnv("AG_MAX_REQ_PER_5M", DEFAULT_MAX_REQ_PER_5M)
-  const rawMin = parseNonNegIntEnv("AG_RATE_COOLDOWN_MIN_MS", DEFAULT_RATE_COOLDOWN_MIN_MS)
-  const minCooldownMs = Math.min(300_000, Math.max(1_000, rawMin || DEFAULT_RATE_COOLDOWN_MIN_MS))
-  const rawMax = parseNonNegIntEnv("AG_RATE_COOLDOWN_MAX_MS", DEFAULT_RATE_COOLDOWN_MAX_MS)
-  const maxCooldownMs = Math.max(minCooldownMs, Math.min(30 * 60 * 1000, rawMax || DEFAULT_RATE_COOLDOWN_MAX_MS))
+function isUltraAccount(s, projectInfo = null) {
+  const proj = projectInfo ?? (s?.rt ? projects.get(s.rt) : null)
+  const candidates = [
+    proj?.paid,
+    proj?.tier,
+    proj?.plan,
+    s?.who ? readLoginsPlan(s.who) : "",
+  ]
+  return candidates.some((v) => ULTRA_PLAN_RE.test(String(v ?? "")))
+}
+
+function rateGuardLimits(isUltra = false) {
+  const maxPerHour = isUltra
+    ? parseNonNegIntEnv("AG_ULTRA_MAX_REQ_PER_HOUR", DEFAULT_ULTRA_MAX_REQ_PER_HOUR)
+    : parseNonNegIntEnv("AG_MAX_REQ_PER_HOUR", DEFAULT_MAX_REQ_PER_HOUR)
+  const maxPer5m = isUltra
+    ? parseNonNegIntEnv("AG_ULTRA_MAX_REQ_PER_5M", DEFAULT_ULTRA_MAX_REQ_PER_5M)
+    : parseNonNegIntEnv("AG_MAX_REQ_PER_5M", DEFAULT_MAX_REQ_PER_5M)
+  const defMin = isUltra ? DEFAULT_ULTRA_RATE_COOLDOWN_MIN_MS : DEFAULT_RATE_COOLDOWN_MIN_MS
+  const defMax = isUltra ? DEFAULT_ULTRA_RATE_COOLDOWN_MAX_MS : DEFAULT_RATE_COOLDOWN_MAX_MS
+  const rawMin = parseNonNegIntEnv(isUltra ? "AG_ULTRA_RATE_COOLDOWN_MIN_MS" : "AG_RATE_COOLDOWN_MIN_MS", defMin)
+  const minCooldownMs = Math.min(300_000, Math.max(1_000, rawMin || defMin))
+  const rawMax = parseNonNegIntEnv(isUltra ? "AG_ULTRA_RATE_COOLDOWN_MAX_MS" : "AG_RATE_COOLDOWN_MAX_MS", defMax)
+  const maxCooldownMs = Math.max(minCooldownMs, Math.min(30 * 60 * 1000, rawMax || defMax))
   return { maxPerHour, maxPer5m, minCooldownMs, maxCooldownMs }
 }
 
@@ -1231,7 +1253,7 @@ function recordPlanDowngradeCooldown(s, cls) {
       accounts: [s.who || masked],
       status: 429,
       suspectRuleBlock: false,
-      globalBreakerTriggered: false,
+      globalTriggered: false,
       errorText: message,
     })
   }
@@ -1292,9 +1314,10 @@ function pruneRateTimestamps(arr, now) {
   return arr
 }
 
-function checkAndConsumeAccountRateLimit(s, now = Date.now()) {
+function checkAndConsumeAccountRateLimit(s, now = Date.now(), projectInfo = null) {
   if (!s?.rt || !isRateGuardEnabled()) return { limited: false }
-  const { maxPerHour, maxPer5m, minCooldownMs, maxCooldownMs } = rateGuardLimits()
+  const ultra = isUltraAccount(s, projectInfo)
+  const { maxPerHour, maxPer5m, minCooldownMs, maxCooldownMs } = rateGuardLimits(ultra)
   if (maxPerHour <= 0 && maxPer5m <= 0) return { limited: false }
 
   const key = accountSalt(s) || s.rt
@@ -1362,9 +1385,10 @@ function checkAndConsumeAccountRateLimit(s, now = Date.now()) {
     })
     if (cooldowns.size > MAX_COOLDOWN_CACHE) pruneBoundedMap(cooldowns, MAX_COOLDOWN_CACHE, isCooldownExpired)
   }
-  console.warn(`[antigravity] soft-rate-guard yield: account=${masked} ${summary} cooldown=${retryAfterSec}s`)
+  console.warn(`[antigravity] soft-rate-guard yield: account=${masked} tier=${ultra ? "ultra" : "pro"} ${summary} cooldown=${retryAfterSec}s`)
   return {
     limited: true,
+    tier: ultra ? "ultra" : "pro",
     retryAfterSec,
     cooldownMs,
     count1h,
@@ -3617,7 +3641,7 @@ async function complete(s, url, init, magpie) {
     if (modelCd.status === 429) res.headers.set("Retry-After", String(modelCd.retryAfterSec))
     return res
   }
-  const rateLimit = checkAndConsumeAccountRateLimit(s)
+  const rateLimit = checkAndConsumeAccountRateLimit(s, Date.now(), l?.project ?? projects.get(s.rt) ?? null)
   if (rateLimit.limited) {
     const res = errorResponse(429, rateLimit.message)
     res.headers.set("Retry-After", String(rateLimit.retryAfterSec))
@@ -4669,6 +4693,8 @@ export const _internal = {
   PLAN_GUARD_ALERT_DEDUP_MS,
   DEFAULT_MAX_REQ_PER_HOUR,
   DEFAULT_MAX_REQ_PER_5M,
+  DEFAULT_ULTRA_MAX_REQ_PER_HOUR,
+  DEFAULT_ULTRA_MAX_REQ_PER_5M,
   RATE_WINDOW_5M_MS,
   RATE_WINDOW_1H_MS,
   accountRateWindows,
@@ -4679,6 +4705,7 @@ export const _internal = {
   isFreeEmailWhitelisted,
   planGuardCooldownMs,
   isRateGuardEnabled,
+  isUltraAccount,
   rateGuardLimits,
   maskAccountId,
   readLoginsPlan,
