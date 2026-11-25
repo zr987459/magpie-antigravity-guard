@@ -3634,6 +3634,9 @@ async function complete(s, url, init, magpie) {
     return res
   }
   const [sent, at] = sentID(catalogOf(l.infos), model, effort, l.deprecated)
+  if (Array.isArray(l.infos) && l.infos.length > 0 && !l.infos.some((m) => m.id === sent)) {
+    return errorResponse(404, `model ${sent} not found`)
+  }
   const modelCd = activeCooldown(GLOBAL_BREAKER_KEY) ?? activeCooldown(acctCooldownKey(s)) ?? activeCooldown(modelCooldownKey(s, sent))
   if (modelCd) {
     if (modelCd.status === 401 || modelCd.oauthDead) return errorResponse(401, modelCd.message, "expired")

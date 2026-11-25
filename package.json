@@ -1,7 +1,7 @@
 {
   "name": "@magpie-community/opencode-antigravity-auth",
-  "version": "0.1.20",
-  "description": "Hardened Antigravity plugin for Magpie with external_system_instructions isolation, Codex/Claude/PR#3967 anti-429 guard, 3-tier circuit breaker, and self-contained cloud rule hot-sync",
+  "version": "0.2.3",
+  "description": "Hardened Antigravity 0.2.3 plugin for Magpie with strict version-CL pairing, external_system_instructions isolation, permanent Pi-Web & Claude/Codex zero-leak sanitization, 504 timeout budget, 3-tier circuit breaker, and self-contained cloud rule hot-sync",
   "type": "module",
   "main": "./opencode.mjs",
   "exports": {

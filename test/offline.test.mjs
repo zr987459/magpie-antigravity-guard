@@ -237,6 +237,42 @@ const shapedPre = _internal.shape(
 )
 assert.deepEqual(shapedPre, shapedDefault)
 
+// 10. complete() must fast-return 404 without network or rate-limit consumption when model is absent from account catalog
+{
+  const rtNoCarbon = "rt-no-carbon-test"
+  const acctKey = `acct:${rtNoCarbon}`
+  _internal.lists.set(rtNoCarbon, {
+    at: Date.now(),
+    infos: [
+      { id: "gemini-4-hydrogen-high", name: "Gemini 4 Hydrogen (High)", thinkingLevel: "high", remaining: 0.9, resets: "" },
+    ],
+    project: { id: "proj-test", plan: "Google AI Pro", tier: "standard-tier", paid: "", credits: true, at: Date.now() },
+    deprecated: {},
+  })
+  _internal.projects.set(rtNoCarbon, { id: "proj-test", plan: "Google AI Pro", tier: "standard-tier", paid: "", credits: true, at: Date.now() })
+  _internal.accountRateWindows.delete(rtNoCarbon)
+  try {
+    const res = await _internal.complete(
+      { rt: rtNoCarbon, who: "pro-no-4c@example.com", project: "proj-test", access: "tok", expires: Date.now() + 60_000 },
+      "https://daily-cloudcode-pa.googleapis.com/v1beta/models/gemini-4-carbon:generateContent",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-magpie-effort": "high" },
+        body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }),
+      },
+    )
+    assert.equal(res.status, 404, "missing model in account catalog should fast-return 404")
+    const body = await res.json()
+    assert.match(body?.error?.message || "", /gemini-4-carbon.*not found/i)
+    assert.equal(_internal.cooldowns.has(acctKey), false, "missing model must NOT set account cooldown")
+    assert.equal(_internal.accountRateWindows.has(rtNoCarbon), false, "missing model must NOT consume rate-limit budget")
+  } finally {
+    _internal.lists.delete(rtNoCarbon)
+    _internal.projects.delete(rtNoCarbon)
+    _internal.accountRateWindows.delete(rtNoCarbon)
+  }
+}
+
 console.log(
   `OFFLINE_SUITE_OK platform=${os.platform()} dir=${_internal.PLUGIN_DIR} dynamicRules=${_internal.dynamicState.rules.length}`,
 )
