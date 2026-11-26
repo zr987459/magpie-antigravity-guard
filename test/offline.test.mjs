@@ -273,6 +273,78 @@ assert.deepEqual(shapedPre, shapedDefault)
   }
 }
 
+// 11. Antigravity v2.35.2 baseline, dynamic hot-override, userPromptId UUID, and ClientMetadata
+{
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+  assert.equal(_internal.DEFAULT_VERSION, "2.35.2")
+  assert.equal(_internal.CLS["2.35.2"], "1029311855")
+  assert.equal(_internal.resolveVersion("2.35.2"), "2.35.2")
+  assert.equal(_internal.clOf("2.35.2"), "1029311855")
+
+  _internal.ver.v = "2.35.2"
+  _internal.ver.at = Date.now()
+  const ua = await _internal.userAgent()
+  assert.ok(ua.includes("antigravity/hub/2.35.2"), ua)
+  assert.ok(ua.includes("cl=1029311855"), ua)
+
+  const cm = await _internal.clientMetadata()
+  assert.deepEqual(cm, { ideType: "ANTIGRAVITY", ideVersion: "2.35.2", ideName: "antigravity" })
+
+  // Dynamic hot-override check (future 2.36.0)
+  const rulesSnapshot = JSON.parse(fs.readFileSync(_internal.DYNAMIC_RULES_PATH, "utf8"))
+  _internal.applyDynamicRulesData({
+    ...rulesSnapshot,
+    clientMeta: {
+      cls: { "2.32.1": "1021296516", "2.35.2": "1029311855", "2.36.0": "1030000001" },
+      defaultVersion: "2.36.0",
+    },
+  })
+  assert.equal(_internal.resolveVersion("2.36.0"), "2.36.0")
+  assert.equal(_internal.clOf("2.36.0"), "1030000001")
+  assert.equal(_internal.resolveVersion(""), "2.36.0")
+  _internal.ver.v = "2.35.2"
+  _internal.reloadDynamicRules(true)
+
+  // envelope() userPromptId UUID generation & passthrough
+  const env1 = _internal.envelope(
+    { contents: [{ role: "user", parts: [{ text: "hello" }] }] },
+    "gemini-3-flash",
+    "proj-1",
+    false,
+    { "x-magpie-session": "sess-1" },
+    "acct-salt-1",
+  )
+  const env2 = _internal.envelope(
+    { contents: [{ role: "user", parts: [{ text: "hello" }] }] },
+    "gemini-3-flash",
+    "proj-1",
+    false,
+    { "x-magpie-session": "sess-1" },
+    "acct-salt-1",
+  )
+  assert.match(env1.userPromptId, uuidRe)
+  assert.match(env2.userPromptId, uuidRe)
+  assert.notEqual(env1.userPromptId, env2.userPromptId)
+
+  const fixedPromptId = "11111111-2222-4333-8444-555555555555"
+  const envPassBody = _internal.envelope(
+    { contents: [{ role: "user", parts: [{ text: "hi" }] }], userPromptId: fixedPromptId },
+    "gemini-3-flash",
+    "proj-1",
+  )
+  assert.equal(envPassBody.userPromptId, fixedPromptId)
+  assert.equal("userPromptId" in envPassBody.request, false)
+
+  const envPassHdr = _internal.envelope(
+    { contents: [{ role: "user", parts: [{ text: "hi" }] }] },
+    "gemini-3-flash",
+    "proj-1",
+    false,
+    { "x-user-prompt-id": fixedPromptId },
+  )
+  assert.equal(envPassHdr.userPromptId, fixedPromptId)
+}
+
 console.log(
   `OFFLINE_SUITE_OK platform=${os.platform()} dir=${_internal.PLUGIN_DIR} dynamicRules=${_internal.dynamicState.rules.length}`,
 )

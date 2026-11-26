@@ -344,6 +344,79 @@ try {
     resetState()
   }
 
+  // 8. loadCodeAssist carries ClientMetadata (ideType, ideVersion, ideName) and v2.35.2 User-Agent
+  {
+    const origReq = https.request
+    const capturedCalls = []
+    _internal.ver.v = "2.35.2"
+    _internal.ver.at = Date.now()
+    https.request = (opts, cb) => {
+      assert.equal(opts?.hostname, "cloudcode-pa.googleapis.com")
+      const chunks = []
+      const req = new EventEmitter()
+      req.setTimeout = () => {}
+      req.write = (chunk) => {
+        if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)))
+      }
+      req.destroy = () => {}
+      req.end = (chunk) => {
+        if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)))
+        capturedCalls.push({
+          path: opts?.path,
+          headers: opts?.headers || {},
+          body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+        })
+        setTimeout(() => {
+          const res = new EventEmitter()
+          res.statusCode = 200
+          res.statusMessage = "OK"
+          res.headers = { "content-type": "application/json" }
+          res.complete = true
+          res.pause = () => {}
+          res.resume = () => {}
+          res.destroy = () => {}
+          cb(res)
+          res.emit(
+            "data",
+            Buffer.from(
+              JSON.stringify({
+                cloudaicompanionProject: "proj-v2352",
+                currentTier: { id: "g1-pro-tier", name: "Google AI Pro" },
+                paidTier: { id: "g1-pro-tier", name: "Google AI Pro" },
+              }),
+            ),
+          )
+          res.emit("end")
+        }, 5)
+      }
+      return req
+    }
+    try {
+      const sMeta = {
+        rt: "rt-meta-v2352",
+        who: "meta-v2352@example.com",
+        access: "tok-meta-v2352",
+        expires: Date.now() + 3600_000,
+      }
+      _internal.tokens.set(sMeta.rt, { access: sMeta.access, expires: sMeta.expires })
+      const proj = await _internal.project(sMeta, true)
+      assert.equal(proj.id, "proj-v2352")
+      assert.equal(capturedCalls.length, 1)
+      assert.deepEqual(capturedCalls[0].body.metadata, {
+        ideType: "ANTIGRAVITY",
+        ideVersion: "2.35.2",
+        ideName: "antigravity",
+      })
+      const uaHdr = capturedCalls[0].headers["User-Agent"] || capturedCalls[0].headers["user-agent"] || ""
+      assert.ok(uaHdr.includes("antigravity/hub/2.35.2"), uaHdr)
+      assert.ok(uaHdr.includes("cl=1029311855"), uaHdr)
+    } finally {
+      https.request = origReq
+      _internal.projects.delete("rt-meta-v2352")
+      resetState()
+    }
+  }
+
   console.log("AG_HARDENING_TESTS_OK")
 } finally {
   resetState()

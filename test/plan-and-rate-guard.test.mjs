@@ -139,47 +139,47 @@ try {
   const warmupText = fs.readFileSync(WARMUP_FILE, "utf8")
   assert.equal(warmupText.includes("old-pro-1@example.com"), false, "account-warmup.json must not store raw email")
 
-  // Old Pro accounts -> immediately pro-mature (2c / 15 / 30 / 120)
+  // Old Pro accounts -> immediately pro-mature (2c / 15 / 50 / 200)
   const oldProAcct = { rt: "rt-old-pro-2", who: "old-pro-1@example.com" }
   const oldTier = _internal.resolveAccountRateTier(oldProAcct, now, { plan: "Google AI Pro", tier: "g1-pro-tier", paid: "g1-pro-tier" })
   assert.equal(oldTier.tier, "pro-mature")
   assert.equal(oldTier.maxInflight, 2)
   assert.equal(oldTier.maxPer1m, 15)
-  assert.equal(oldTier.maxPer5m, 30)
-  assert.equal(oldTier.maxPerHour, 120)
+  assert.equal(oldTier.maxPer5m, 50)
+  assert.equal(oldTier.maxPerHour, 200)
 
-  // Brand-new Ultra account -> 0~24h ultra-warmup-d1 (1c / 4 / 12 / 45)
+  // Brand-new Ultra account -> 0~24h ultra-warmup-d1 (1c / 6 / 20 / 75)
   const newUltraAcct = { rt: "rt-new-ultra-1", who: "new-ultra-1@example.com" }
   const ultraProj = { plan: "Google AI Ultra", tier: "g1-ultra-tier", paid: "g1-ultra-tier" }
   const d1Tier = _internal.resolveAccountRateTier(newUltraAcct, now, ultraProj)
   assert.equal(d1Tier.tier, "ultra-warmup-d1")
   assert.equal(d1Tier.maxInflight, 1)
-  assert.equal(d1Tier.maxPer1m, 4)
-  assert.equal(d1Tier.maxPer5m, 12)
-  assert.equal(d1Tier.maxPerHour, 45)
+  assert.equal(d1Tier.maxPer1m, 6)
+  assert.equal(d1Tier.maxPer5m, 20)
+  assert.equal(d1Tier.maxPerHour, 75)
   assert.equal(d1Tier.minCooldownMs, 45_000)
   assert.equal(d1Tier.maxCooldownMs, 180_000)
 
   // Raw refresh token must never appear in account-warmup.json
   assert.equal(fs.readFileSync(WARMUP_FILE, "utf8").includes("rt-new-ultra-1"), false)
 
-  // 24~48h -> ultra-warmup-d2 (1c / 6 / 22 / 90)
+  // 24~48h -> ultra-warmup-d2 (1c / 9 / 35 / 130)
   const d2Tier = _internal.resolveAccountRateTier(newUltraAcct, now + 25 * 3600_000, ultraProj)
   assert.equal(d2Tier.tier, "ultra-warmup-d2")
   assert.equal(d2Tier.maxInflight, 1)
-  assert.equal(d2Tier.maxPer1m, 6)
-  assert.equal(d2Tier.maxPer5m, 22)
-  assert.equal(d2Tier.maxPerHour, 90)
+  assert.equal(d2Tier.maxPer1m, 9)
+  assert.equal(d2Tier.maxPer5m, 35)
+  assert.equal(d2Tier.maxPerHour, 130)
   assert.equal(d2Tier.minCooldownMs, 30_000)
   assert.equal(d2Tier.maxCooldownMs, 150_000)
 
-  // > 48h -> ultra-mature (2c / 10 / 40 / 180, soft cooldown 30s~180s)
+  // > 48h -> ultra-mature (2c / 15 / 55 / 240, soft cooldown 30s~180s)
   const matureUltraTier = _internal.resolveAccountRateTier(newUltraAcct, now + 49 * 3600_000, ultraProj)
   assert.equal(matureUltraTier.tier, "ultra-mature")
   assert.equal(matureUltraTier.maxInflight, 2)
-  assert.equal(matureUltraTier.maxPer1m, 10)
-  assert.equal(matureUltraTier.maxPer5m, 40)
-  assert.equal(matureUltraTier.maxPerHour, 180)
+  assert.equal(matureUltraTier.maxPer1m, 15)
+  assert.equal(matureUltraTier.maxPer5m, 55)
+  assert.equal(matureUltraTier.maxPerHour, 240)
   assert.equal(matureUltraTier.minCooldownMs, 30_000)
   assert.equal(matureUltraTier.maxCooldownMs, 180_000)
 
@@ -191,7 +191,7 @@ try {
   const upTier = _internal.resolveAccountRateTier(upAcct, tUpgrade, ultraProj)
   assert.equal(upTier.tier, "ultra-warmup-d1", "free->ultra upgrade must restart 48h warmup at d1")
   assert.equal(upTier.maxInflight, 1)
-  assert.equal(upTier.maxPer1m, 4)
+  assert.equal(upTier.maxPer1m, 6)
 
   // =========================================================================
   // 3. 4-Dimensional Burst & Window Guard (1m, 5m, 1h, no cooldowns.json/alerts/breaker)
@@ -202,12 +202,12 @@ try {
   // Make it mature (> 48h)
   _internal.resolveAccountRateTier(testUltra, baseT - 72 * 3600_000, ultraProj)
 
-  // 3a) 1m burst limit = 10 for mature ultra
-  for (let i = 0; i < 10; i++) {
+  // 3a) 1m burst limit = 15 for mature ultra
+  for (let i = 0; i < 15; i++) {
     const r = _internal.checkAndConsumeAccountRateLimit(testUltra, baseT + i * 100, ultraProj)
     assert.equal(r.limited, false, `req ${i} should pass 1m limit`)
   }
-  const hit1m = _internal.checkAndConsumeAccountRateLimit(testUltra, baseT + 1500, ultraProj)
+  const hit1m = _internal.checkAndConsumeAccountRateLimit(testUltra, baseT + 2000, ultraProj)
   assert.equal(hit1m.limited, true)
   assert.equal(hit1m.tier, "ultra-mature")
   assert.ok(hit1m.message.includes("[本地养号防封刹车·非Google限流]"), hit1m.message)
@@ -222,25 +222,26 @@ try {
   const persistedDoc = JSON.parse(fs.readFileSync(COOLDOWNS_FILE, "utf8"))
   assert.equal(`acct:${testUltra.rt}` in persistedDoc, false, "soft_rate_limit must never leak into cooldowns.json")
 
-  // 3b) 5m window limit = 40 for mature ultra (spread 4 reqs/min over 4 mins = 16, then 10+10+... up to 40)
+  // 3b) 5m window limit = 55 for mature ultra (15 + 15 + 15 + 10 = 55 spread over 4 mins)
   resetAllState()
   _internal.resolveAccountRateTier(testUltra, baseT - 72 * 3600_000, ultraProj)
-  for (let m = 0; m < 4; m++) {
-    for (let j = 0; j < 10; j++) {
+  const batches5m = [15, 15, 15, 10]
+  for (let m = 0; m < batches5m.length; m++) {
+    for (let j = 0; j < batches5m[m]; j++) {
       const r = _internal.checkAndConsumeAccountRateLimit(testUltra, baseT + m * 61_000 + j * 100, ultraProj)
       assert.equal(r.limited, false, `5m spread m=${m} j=${j} should pass`)
     }
   }
-  // 41st request within 5m window (after 61s since last batch so 1m is clear, but 5m=40/40!)
+  // 56th request within 5m window (after 61s since last batch so 1m is clear, but 5m=55/55!)
   const hit5m = _internal.checkAndConsumeAccountRateLimit(testUltra, baseT + 4 * 61_000, ultraProj)
   assert.equal(hit5m.limited, true)
-  assert.ok(hit5m.message.includes("5m=40/40"), hit5m.message)
+  assert.ok(hit5m.message.includes("5m=55/55"), hit5m.message)
 
-  // 3c) 1h window limit = 180 for mature ultra (spread 30 per 6m across 6 windows = 180)
+  // 3c) 1h window limit = 240 for mature ultra (40 per 6m across 6 windows = 240)
   resetAllState()
   _internal.resolveAccountRateTier(testUltra, baseT - 72 * 3600_000, ultraProj)
   for (let block = 0; block < 6; block++) {
-    for (let sub = 0; sub < 3; sub++) {
+    for (let sub = 0; sub < 4; sub++) {
       for (let j = 0; j < 10; j++) {
         const ts = baseT + block * 360_000 + sub * 61_000 + j * 50
         const r = _internal.checkAndConsumeAccountRateLimit(testUltra, ts, ultraProj)
@@ -250,7 +251,7 @@ try {
   }
   const hit1h = _internal.checkAndConsumeAccountRateLimit(testUltra, baseT + 6 * 360_000, ultraProj)
   assert.equal(hit1h.limited, true)
-  assert.ok(hit1h.message.includes("1h=180/180"), hit1h.message)
+  assert.ok(hit1h.message.includes("1h=240/240"), hit1h.message)
 
   // =========================================================================
   // 4. Per-Account Inflight Concurrency Cap & Strict Stream/Error/Cancel/Abort/TTL Release

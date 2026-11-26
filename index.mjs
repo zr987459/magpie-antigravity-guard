@@ -63,12 +63,12 @@ const NPM = "@ai-sdk/google"
 const VERSION_URL = "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml"
 // the newest version with an exact known CL in CLS; Google serves Gemini 4
 // to releases >= 2.20, and we never emit a version without its matching CL
-const DEFAULT_VERSION = "2.32.1"
+const DEFAULT_VERSION = "2.35.2"
 // CLS is the build changelist each release's language server puts in its
 // User-Agent (cl=), read from the shipped binary's requests. The manifest
 // names only the version, so a newer release goes with the newest known
 // changelist until it is added here.
-const CLS = { "2.32.1": "1021296516" }
+const CLS = { "2.32.1": "1021296516", "2.35.2": "1029311855" }
 
 const SIGN_IN_TIMEOUT = 10 * 60 * 1000
 const MODELS_TTL = 10 * 60 * 1000
@@ -1480,7 +1480,6 @@ async function version() {
   if (ver.v && Date.now() - ver.at < VERSION_TTL) return resolveVersion(ver.v)
   if (ver.pending) return ver.pending
   ver.at = Date.now()
-  if (!ver.v) ver.v = DEFAULT_VERSION
   ver.pending = (async () => {
     let read = ""
     try {
@@ -1709,30 +1708,30 @@ const RATE_WINDOW_5M_MS = 5 * 60 * 1000
 const RATE_WINDOW_1H_MS = 60 * 60 * 1000
 const DEFAULT_MAX_INFLIGHT = 2
 const DEFAULT_MAX_REQ_PER_1M = 15
-const DEFAULT_MAX_REQ_PER_5M = 30
-const DEFAULT_MAX_REQ_PER_HOUR = 120
+const DEFAULT_MAX_REQ_PER_5M = 50
+const DEFAULT_MAX_REQ_PER_HOUR = 200
 const DEFAULT_RATE_COOLDOWN_MIN_MS = 15 * 1000
 const DEFAULT_RATE_COOLDOWN_MAX_MS = 5 * 60 * 1000
 const DEFAULT_ULTRA_MAX_INFLIGHT = 2
-const DEFAULT_ULTRA_MAX_REQ_PER_1M = 10
-const DEFAULT_ULTRA_MAX_REQ_PER_5M = 40
-const DEFAULT_ULTRA_MAX_REQ_PER_HOUR = 180
+const DEFAULT_ULTRA_MAX_REQ_PER_1M = 15
+const DEFAULT_ULTRA_MAX_REQ_PER_5M = 55
+const DEFAULT_ULTRA_MAX_REQ_PER_HOUR = 240
 const DEFAULT_ULTRA_RATE_COOLDOWN_MIN_MS = 30 * 1000
 const DEFAULT_ULTRA_RATE_COOLDOWN_MAX_MS = 180 * 1000
 const DEFAULT_WARMUP_HOURS = 48
 const WARMUP_D1_LIMITS = {
   maxInflight: 1,
-  maxPer1m: 4,
-  maxPer5m: 12,
-  maxPerHour: 45,
+  maxPer1m: 6,
+  maxPer5m: 20,
+  maxPerHour: 75,
   minCooldownMs: 45 * 1000,
   maxCooldownMs: 180 * 1000,
 }
 const WARMUP_D2_LIMITS = {
   maxInflight: 1,
-  maxPer1m: 6,
-  maxPer5m: 22,
-  maxPerHour: 90,
+  maxPer1m: 9,
+  maxPer5m: 35,
+  maxPerHour: 130,
   minCooldownMs: 30 * 1000,
   maxCooldownMs: 150 * 1000,
 }
@@ -3049,7 +3048,11 @@ async function onboard(s, req, headers) {
   throw new Error("Antigravity: setting the account up for Code Assist is taking long; try again in a minute")
 }
 
-const LOAD_BODY = { metadata: { ideType: "ANTIGRAVITY" } }
+async function clientMetadata() {
+  if (typeof reloadDynamicRules === "function") reloadDynamicRules()
+  const v = resolveVersion(await version())
+  return { ideType: "ANTIGRAVITY", ideVersion: v, ideName: "antigravity" }
+}
 
 // resolveProject finds the project the account is served under, setting
 // the account up when Code Assist has none for it
@@ -3057,7 +3060,7 @@ async function resolveProject(s, opts = {}) {
   rememberAccountIdentity(s)
   let load, err
   try {
-    load = await call(s, PROD, "loadCodeAssist", LOAD_BODY, {}, undefined, opts)
+    load = await call(s, PROD, "loadCodeAssist", { metadata: await clientMetadata() }, {}, undefined, opts)
   } catch (e) {
     err = e
   }
@@ -3080,9 +3083,9 @@ async function resolveProject(s, opts = {}) {
   }
   const t = { ...defaultTier(load) }
   if (!t.id || t.id === "legacy-tier") t.id = "free-tier"
-  // as the app's language server asks it: camelCase, the IDE type only,
-  // and no headers of its own
-  const id = await onboard(s, { tierId: t.id, metadata: { ideType: "ANTIGRAVITY" } })
+  // as the app's language server asks it: camelCase ClientMetadata
+  // with safe dynamic IDE identity fields, and no headers of its own
+  const id = await onboard(s, { tierId: t.id, metadata: await clientMetadata() })
   if (!id) {
     const why = (load.ineligibleTiers ?? []).find((x) => x?.reasonMessage)?.reasonMessage
     throw new Error(why ? "Antigravity won't serve this Google account: " + why : "Antigravity hasn't set this Google account up (it gave no project); sign in to the Antigravity app with it once, then try again")
@@ -3106,7 +3109,7 @@ async function project(s, forceRefresh = false, opts = {}) {
   if (ttl > 0 && Date.now() - p.at < ttl) return p
   // the tiers, read again every hour (or after 60s when explicitly refreshed): a plan bought or lapsed since
   try {
-    const load = await call(s, PROD, "loadCodeAssist", LOAD_BODY, {}, undefined, opts)
+    const load = await call(s, PROD, "loadCodeAssist", { metadata: await clientMetadata() }, {}, undefined, opts)
     const { tier, paid, credits } = tiersOf(load)
     if (tier || paid) {
       p = { ...p, tier, paid, credits, plan: planOf(load) }
@@ -3978,7 +3981,8 @@ function sanitizeClientMeta(rawMeta) {
     }
   }
   const rawDef = typeof rawMeta?.defaultVersion === "string" ? rawMeta.defaultVersion.trim() : ""
-  const defaultVersion = cls[rawDef] ? rawDef : highestKnownVersion(cls)
+  const defaultVersion =
+    cls[rawDef] && cmpVersion(rawDef, DEFAULT_VERSION) >= 0 ? rawDef : highestKnownVersion(cls)
   return { cls, defaultVersion }
 }
 
@@ -4034,6 +4038,9 @@ function applyDynamicRulesData(data, mtimeMs = dynamicState.mtimeMs) {
   const prevResolved = dynamicState.resolvedVersion
   dynamicState.cls = cls
   dynamicState.defaultVersion = defaultVersion
+  if (ver.v && cmpVersion(defaultVersion, ver.v) > 0 && cls[defaultVersion]) {
+    ver.v = defaultVersion
+  }
   const nextResolved = resolveVersion(ver.v || defaultVersion, cls)
   dynamicState.resolvedVersion = nextResolved
   if (prevResolved && nextResolved && prevResolved !== nextResolved) {
@@ -4602,9 +4609,14 @@ function envelope(req, sent, projectID, credits = false, headers = undefined, ac
     used_claude_conservative: String(claude),
     used_non_gemini_model: String(!gemini),
   }
+  const rawUserPromptId =
+    (typeof req?.userPromptId === "string" && req.userPromptId.trim()) ||
+    headerOf(headers, "x-user-prompt-id").trim() ||
+    ""
+  const userPromptId = rawUserPromptId || crypto.randomUUID()
   // the request's own keys in the app's order, labels before
   // generationConfig, the session last
-  const { sessionId: _, labels: __, contents: c, systemInstruction, tools, toolConfig, generationConfig, ...rest } = isObj(req) ? req : {}
+  const { sessionId: _, labels: __, userPromptId: ___, contents: c, systemInstruction, tools, toolConfig, generationConfig, ...rest } = isObj(req) ? req : {}
   const request = { contents: c, systemInstruction, tools, toolConfig, ...rest, labels, generationConfig, sessionId }
   for (const k of Object.keys(request)) if (request[k] === undefined) delete request[k]
   return {
@@ -4615,6 +4627,7 @@ function envelope(req, sent, projectID, credits = false, headers = undefined, ac
     ...(credits ? { enabled_credit_types: [CREDIT] } : {}),
     userAgent: "antigravity",
     requestType: "agent",
+    userPromptId,
   }
 }
 
@@ -5992,6 +6005,7 @@ export const _internal = {
   effectiveCLS,
   enums,
   userAgent,
+  clientMetadata,
   cooldowns,
   DEFAULT_ANTIGRAVITY_SYSTEM,
   recentRiskEvents,
