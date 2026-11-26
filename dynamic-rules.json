@@ -4,9 +4,10 @@
   "systemTag": "external_system_instructions",
   "clientMeta": {
     "cls": {
-      "2.32.1": "1021296516"
+      "2.32.1": "1021296516",
+      "2.35.2": "1029311855"
     },
-    "defaultVersion": "2.32.1"
+    "defaultVersion": "2.35.2"
   },
   "upstream": {
     "antigravity": {
