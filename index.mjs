@@ -150,6 +150,25 @@ const COOLDOWNS_PATH =
   typeof process !== "undefined" && process.env?.MAGPIE_AG_COOLDOWNS_PATH
     ? path.resolve(process.env.MAGPIE_AG_COOLDOWNS_PATH)
     : path.join(PLUGIN_DIR, "cooldowns.json")
+function resolvePluginSiblingConfigPath(fileName) {
+  const primary = path.resolve(PLUGIN_DIR, "..", "..", fileName)
+  try {
+    if (fs.existsSync(primary)) return primary
+    const fromNodeModules = path.resolve(PLUGIN_DIR, "..", "..", "..", "..", fileName)
+    if (PLUGIN_DIR.includes(`${path.sep}node_modules${path.sep}`) && fs.existsSync(fromNodeModules)) {
+      return fromNodeModules
+    }
+  } catch {}
+  return primary
+}
+const PROVIDERS_PATH =
+  typeof process !== "undefined" && process.env?.MAGPIE_AG_PROVIDERS_PATH
+    ? path.resolve(process.env.MAGPIE_AG_PROVIDERS_PATH)
+    : resolvePluginSiblingConfigPath("providers.json")
+const SETTINGS_PATH =
+  typeof process !== "undefined" && process.env?.MAGPIE_AG_SETTINGS_PATH
+    ? path.resolve(process.env.MAGPIE_AG_SETTINGS_PATH)
+    : resolvePluginSiblingConfigPath("settings.json")
 const PROXIES_PATH =
   typeof process !== "undefined" && process.env?.MAGPIE_AG_PROXIES_PATH
     ? path.resolve(process.env.MAGPIE_AG_PROXIES_PATH)
@@ -193,8 +212,62 @@ const accountProxiesState = {
   mtimeMs: -1,
   defaultProxy: null,
   accounts: new Map(), // lowercase email or salt -> proxy descriptor or null
+  accountsDot: new Map(), // dot-stripped gmail -> proxy descriptor or null
   loggedSelections: new Map(), // poolKey -> masked proxy string
   lastParseError: "",
+}
+const providersConfigState = {
+  loaded: false,
+  checkedAt: 0,
+  mtimeMs: -1,
+  providerProxy: { mode: "unset", descriptor: null },
+  accountProxiesExact: new Map(), // lowercase email/key -> { mode: "direct" | "custom", descriptor }
+  accountProxiesDot: new Map(), // dot-stripped gmail -> { mode: "direct" | "custom", descriptor }
+  accountConcurrencyExact: new Map(), // lowercase email/key -> positive integer
+  accountConcurrencyDot: new Map(), // dot-stripped gmail -> positive integer
+  coldStartError: null,
+  lastParseError: "",
+}
+const settingsProxyState = {
+  loaded: false,
+  checkedAt: 0,
+  mtimeMs: -1,
+  globalProxy: { mode: "unset", descriptor: null },
+  coldStartError: null,
+  lastParseError: "",
+}
+
+function gmailDotStrippedKey(email) {
+  const norm = String(email ?? "").trim().toLowerCase()
+  const at = norm.lastIndexOf("@")
+  if (at <= 0) return ""
+  const local = norm.slice(0, at)
+  const domain = norm.slice(at + 1)
+  if (domain !== "gmail.com" && domain !== "googlemail.com") return ""
+  return `${local.replace(/\./g, "")}@${domain}`
+}
+
+function lookupEmailNormalized(exactMap, dotMap, email, fallbackKey = "") {
+  const emailNorm = String(email ?? "").trim().toLowerCase()
+  if (emailNorm) {
+    if (exactMap && exactMap.has(emailNorm)) {
+      return { found: true, value: exactMap.get(emailNorm) }
+    }
+    const dotKey = gmailDotStrippedKey(emailNorm)
+    if (dotKey) {
+      if (exactMap && exactMap.has(dotKey)) {
+        return { found: true, value: exactMap.get(dotKey) }
+      }
+      if (dotMap && dotMap.has(dotKey)) {
+        return { found: true, value: dotMap.get(dotKey) }
+      }
+    }
+  }
+  const keyNorm = String(fallbackKey ?? "").trim().toLowerCase()
+  if (keyNorm && exactMap && exactMap.has(keyNorm)) {
+    return { found: true, value: exactMap.get(keyNorm) }
+  }
+  return { found: false, value: undefined }
 }
 
 function maskProxyUrl(raw) {
@@ -249,6 +322,166 @@ function parseProxyDescriptor(raw) {
   }
 }
 
+function parseUiProxyEntry(raw) {
+  if (raw === null || raw === undefined) return { mode: "unset", descriptor: null }
+  const s = String(raw).trim()
+  if (!s) return { mode: "unset", descriptor: null }
+  if (s.toLowerCase() === "direct") return { mode: "direct", descriptor: null }
+  return { mode: "custom", descriptor: parseProxyDescriptor(s) }
+}
+
+function reloadProvidersConfig(force = false) {
+  const now = Date.now()
+  if (!force && providersConfigState.loaded && now - providersConfigState.checkedAt < PROXIES_RELOAD_INTERVAL_MS) {
+    return providersConfigState
+  }
+  providersConfigState.checkedAt = now
+  try {
+    if (!fs.existsSync(PROVIDERS_PATH)) {
+      providersConfigState.loaded = true
+      providersConfigState.mtimeMs = -1
+      providersConfigState.providerProxy = { mode: "unset", descriptor: null }
+      providersConfigState.accountProxiesExact = new Map()
+      providersConfigState.accountProxiesDot = new Map()
+      providersConfigState.accountConcurrencyExact = new Map()
+      providersConfigState.accountConcurrencyDot = new Map()
+      providersConfigState.coldStartError = null
+      providersConfigState.lastParseError = ""
+      return providersConfigState
+    }
+    const st = fs.statSync(PROVIDERS_PATH)
+    if (!force && providersConfigState.loaded && st.mtimeMs === providersConfigState.mtimeMs) {
+      return providersConfigState
+    }
+    const raw = JSON.parse(fs.readFileSync(PROVIDERS_PATH, "utf8"))
+    if (!isObj(raw)) throw new Error("providers.json root must be a JSON object")
+    if (raw.providers !== undefined && !Array.isArray(raw.providers)) {
+      throw new Error("providers.json providers field must be an array")
+    }
+    const list = Array.isArray(raw.providers) ? raw.providers : []
+    const agProvider = list.find((item) => isObj(item) && String(item.id ?? "").trim().toLowerCase() === "antigravity") ?? null
+
+    const nextProviderProxy = parseUiProxyEntry(agProvider?.proxy)
+    const nextProxiesExact = new Map()
+    const nextProxiesDot = new Map()
+    if (isObj(agProvider?.accountProxies)) {
+      for (const [k, v] of Object.entries(agProvider.accountProxies)) {
+        const keyNorm = String(k ?? "").trim().toLowerCase()
+        if (!keyNorm) continue
+        const entry = parseUiProxyEntry(v)
+        if (entry.mode === "unset") continue
+        nextProxiesExact.set(keyNorm, entry)
+        const dotKey = gmailDotStrippedKey(keyNorm)
+        if (dotKey && !nextProxiesDot.has(dotKey)) {
+          nextProxiesDot.set(dotKey, entry)
+        }
+      }
+    }
+
+    const nextConcExact = new Map()
+    const nextConcDot = new Map()
+    if (isObj(agProvider?.accountConcurrency)) {
+      for (const [k, v] of Object.entries(agProvider.accountConcurrency)) {
+        const keyNorm = String(k ?? "").trim().toLowerCase()
+        const cap = Number(v)
+        if (!keyNorm || !Number.isInteger(cap) || cap <= 0) continue
+        nextConcExact.set(keyNorm, cap)
+        const dotKey = gmailDotStrippedKey(keyNorm)
+        if (dotKey && !nextConcDot.has(dotKey)) {
+          nextConcDot.set(dotKey, cap)
+        }
+      }
+    }
+
+    providersConfigState.loaded = true
+    providersConfigState.mtimeMs = st.mtimeMs
+    providersConfigState.providerProxy = nextProviderProxy
+    providersConfigState.accountProxiesExact = nextProxiesExact
+    providersConfigState.accountProxiesDot = nextProxiesDot
+    providersConfigState.accountConcurrencyExact = nextConcExact
+    providersConfigState.accountConcurrencyDot = nextConcDot
+    providersConfigState.coldStartError = null
+    providersConfigState.lastParseError = ""
+  } catch (err) {
+    const msg = err?.message ?? String(err)
+    if (providersConfigState.lastParseError !== msg) {
+      providersConfigState.lastParseError = msg
+      console.warn(`[antigravity] failed to load providers.json (${PROVIDERS_PATH}): ${msg}`)
+    }
+    if (!providersConfigState.loaded) {
+      providersConfigState.loaded = true
+      providersConfigState.mtimeMs = -1
+      providersConfigState.providerProxy = { mode: "unset", descriptor: null }
+      providersConfigState.accountProxiesExact = new Map()
+      providersConfigState.accountProxiesDot = new Map()
+      providersConfigState.accountConcurrencyExact = new Map()
+      providersConfigState.accountConcurrencyDot = new Map()
+      providersConfigState.coldStartError = { invalid: true, url: "", masked: "providers.json", error: msg }
+    }
+  }
+  return providersConfigState
+}
+
+function extractSettingsProxyRaw(raw) {
+  if (!isObj(raw)) return ""
+  const candidates = [
+    raw.proxy,
+    raw.httpsProxy,
+    raw.httpProxy,
+    raw.allProxy,
+    isObj(raw.globalProxy) ? raw.globalProxy.https : raw.globalProxy,
+    isObj(raw.globalProxy) ? raw.globalProxy.http : "",
+    isObj(raw.globalProxy) ? raw.globalProxy.all : "",
+  ]
+  for (const c of candidates) {
+    if (typeof c === "string" && c.trim()) return c.trim()
+  }
+  return ""
+}
+
+function reloadGlobalSettingsProxy(force = false) {
+  const now = Date.now()
+  if (!force && settingsProxyState.loaded && now - settingsProxyState.checkedAt < PROXIES_RELOAD_INTERVAL_MS) {
+    return settingsProxyState
+  }
+  settingsProxyState.checkedAt = now
+  try {
+    if (!fs.existsSync(SETTINGS_PATH)) {
+      settingsProxyState.loaded = true
+      settingsProxyState.mtimeMs = -1
+      settingsProxyState.globalProxy = { mode: "unset", descriptor: null }
+      settingsProxyState.coldStartError = null
+      settingsProxyState.lastParseError = ""
+      return settingsProxyState
+    }
+    const st = fs.statSync(SETTINGS_PATH)
+    if (!force && settingsProxyState.loaded && st.mtimeMs === settingsProxyState.mtimeMs) {
+      return settingsProxyState
+    }
+    const raw = JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf8"))
+    if (!isObj(raw)) throw new Error("settings.json root must be a JSON object")
+    const rawProxy = extractSettingsProxyRaw(raw)
+    settingsProxyState.loaded = true
+    settingsProxyState.mtimeMs = st.mtimeMs
+    settingsProxyState.globalProxy = parseUiProxyEntry(rawProxy)
+    settingsProxyState.coldStartError = null
+    settingsProxyState.lastParseError = ""
+  } catch (err) {
+    const msg = err?.message ?? String(err)
+    if (settingsProxyState.lastParseError !== msg) {
+      settingsProxyState.lastParseError = msg
+      console.warn(`[antigravity] failed to load settings.json (${SETTINGS_PATH}): ${msg}`)
+    }
+    if (!settingsProxyState.loaded) {
+      settingsProxyState.loaded = true
+      settingsProxyState.mtimeMs = -1
+      settingsProxyState.globalProxy = { mode: "unset", descriptor: null }
+      settingsProxyState.coldStartError = { invalid: true, url: "", masked: "settings.json", error: msg }
+    }
+  }
+  return settingsProxyState
+}
+
 function reloadAccountProxies(force = false) {
   const now = Date.now()
   if (!force && accountProxiesState.loaded && now - accountProxiesState.checkedAt < PROXIES_RELOAD_INTERVAL_MS) {
@@ -261,6 +494,7 @@ function reloadAccountProxies(force = false) {
       accountProxiesState.mtimeMs = -1
       accountProxiesState.defaultProxy = null
       accountProxiesState.accounts = new Map()
+      accountProxiesState.accountsDot = new Map()
       accountProxiesState.lastParseError = ""
       return accountProxiesState
     }
@@ -272,17 +506,24 @@ function reloadAccountProxies(force = false) {
     if (!isObj(raw)) throw new Error("account-proxies.json root must be a JSON object")
     const nextDefault = parseProxyDescriptor(raw.default)
     const nextAccounts = new Map()
+    const nextAccountsDot = new Map()
     if (isObj(raw.accounts)) {
       for (const [k, v] of Object.entries(raw.accounts)) {
         const keyNorm = String(k ?? "").trim().toLowerCase()
         if (!keyNorm) continue
-        nextAccounts.set(keyNorm, parseProxyDescriptor(v))
+        const desc = parseProxyDescriptor(v)
+        nextAccounts.set(keyNorm, desc)
+        const dotKey = gmailDotStrippedKey(keyNorm)
+        if (dotKey && !nextAccountsDot.has(dotKey)) {
+          nextAccountsDot.set(dotKey, desc)
+        }
       }
     }
     accountProxiesState.loaded = true
     accountProxiesState.mtimeMs = st.mtimeMs
     accountProxiesState.defaultProxy = nextDefault
     accountProxiesState.accounts = nextAccounts
+    accountProxiesState.accountsDot = nextAccountsDot
     accountProxiesState.lastParseError = ""
   } catch (err) {
     const msg = err?.message ?? String(err)
@@ -295,6 +536,7 @@ function reloadAccountProxies(force = false) {
       accountProxiesState.mtimeMs = -1
       accountProxiesState.defaultProxy = { invalid: true, url: "", masked: "account-proxies.json", error: msg }
       accountProxiesState.accounts = new Map()
+      accountProxiesState.accountsDot = new Map()
     }
   }
   return accountProxiesState
@@ -320,8 +562,9 @@ function rememberAccountIdentity(s) {
   }
 }
 
-function resolveProxyForAccount(accountKey, emailHint = "") {
-  const state = reloadAccountProxies(false)
+function resolveUiAccountConcurrency(accountKey, emailHint = "") {
+  const state = reloadProvidersConfig(false)
+  if (state.coldStartError) return null
   const rawKey = String(accountKey ?? "").trim()
   const email = String(
     emailHint ||
@@ -331,12 +574,61 @@ function resolveProxyForAccount(accountKey, emailHint = "") {
   )
     .trim()
     .toLowerCase()
-  let chosen = state.defaultProxy
-  if (email && state.accounts.has(email)) {
-    chosen = state.accounts.get(email) ?? null
-  } else if (rawKey && state.accounts.has(rawKey.toLowerCase())) {
-    chosen = state.accounts.get(rawKey.toLowerCase()) ?? null
+  const hit = lookupEmailNormalized(state.accountConcurrencyExact, state.accountConcurrencyDot, email, rawKey)
+  return hit.found && Number.isInteger(hit.value) && hit.value > 0 ? hit.value : null
+}
+
+function resolveProxyForAccount(accountKey, emailHint = "") {
+  const rawKey = String(accountKey ?? "").trim()
+  const email = String(
+    emailHint ||
+      (rawKey ? accountEmailsByKey.get(rawKey) : "") ||
+      (rawKey ? accountEmailsByKey.get(rawKey.toLowerCase()) : "") ||
+      "",
+  )
+    .trim()
+    .toLowerCase()
+
+  const providersState = reloadProvidersConfig(false)
+  let chosen = null
+  if (providersState.coldStartError) {
+    chosen = providersState.coldStartError
+  } else {
+    const acctHit = lookupEmailNormalized(
+      providersState.accountProxiesExact,
+      providersState.accountProxiesDot,
+      email,
+      rawKey,
+    )
+    if (acctHit.found && acctHit.value?.mode === "direct") {
+      chosen = null
+    } else if (acctHit.found && acctHit.value?.mode === "custom") {
+      chosen = acctHit.value.descriptor
+    } else if (providersState.providerProxy.mode === "direct") {
+      chosen = null
+    } else if (providersState.providerProxy.mode === "custom") {
+      chosen = providersState.providerProxy.descriptor
+    } else {
+      const settingsState = reloadGlobalSettingsProxy(false)
+      if (settingsState.coldStartError) {
+        chosen = settingsState.coldStartError
+      } else if (settingsState.globalProxy.mode === "direct") {
+        chosen = null
+      } else if (settingsState.globalProxy.mode === "custom") {
+        chosen = settingsState.globalProxy.descriptor
+      } else {
+        const legacyState = reloadAccountProxies(false)
+        const legacyHit = lookupEmailNormalized(
+          legacyState.accounts,
+          legacyState.accountsDot,
+          email,
+          rawKey,
+        )
+        chosen = legacyHit.found ? (legacyHit.value ?? null) : legacyState.defaultProxy
+      }
+    }
   }
+
   const logKey = email || rawKey || "default"
   const masked = chosen ? chosen.masked : "direct"
   if (accountProxiesState.loggedSelections.get(logKey) !== masked) {
@@ -1416,7 +1708,7 @@ const RATE_WINDOW_1M_MS = 60 * 1000
 const RATE_WINDOW_5M_MS = 5 * 60 * 1000
 const RATE_WINDOW_1H_MS = 60 * 60 * 1000
 const DEFAULT_MAX_INFLIGHT = 2
-const DEFAULT_MAX_REQ_PER_1M = 8
+const DEFAULT_MAX_REQ_PER_1M = 15
 const DEFAULT_MAX_REQ_PER_5M = 30
 const DEFAULT_MAX_REQ_PER_HOUR = 120
 const DEFAULT_RATE_COOLDOWN_MIN_MS = 15 * 1000
@@ -2164,11 +2456,17 @@ function resolveAccountRateTier(s, now = Date.now(), projectInfo = null) {
     limits = rateGuardLimits(isUltra)
   }
 
+  const uiConcurrency = s ? resolveUiAccountConcurrency(rtSalt || s.rt || "", s.who) : null
+  if (Number.isInteger(uiConcurrency) && uiConcurrency > 0 && uiConcurrency < limits.maxInflight) {
+    limits.maxInflight = uiConcurrency
+  }
+
   const proxyDesc = s ? resolveProxyForAccount(rtSalt || s.rt || "", s.who) : null
   const proxyLabel = proxyDesc ? proxyDesc.masked : "direct"
   const logKey = rtSalt || eHash || masked
-  if (accountWarmupState.loggedTiers.get(logKey) !== tierName) {
-    accountWarmupState.loggedTiers.set(logKey, tierName)
+  const tierSig = `${tierName}:${limits.maxInflight}c`
+  if (accountWarmupState.loggedTiers.get(logKey) !== tierSig) {
+    accountWarmupState.loggedTiers.set(logKey, tierSig)
     while (accountWarmupState.loggedTiers.size > 256) {
       const oldest = accountWarmupState.loggedTiers.keys().next().value
       if (oldest === undefined) break
@@ -2298,7 +2596,7 @@ function checkAndConsumeAccountRateLimit(s, now = Date.now(), projectInfo = null
   if (hit5m) parts.push(`5m=${count5m}/${maxPer5m}`)
   if (hit1h) parts.push(`1h=${count1h}/${maxPerHour}`)
   const summary = parts.join(", ")
-  const message = `Antigravity: local soft rate limit reached for ${masked} (tier=${tier}, ${summary}); yielding for ${retryAfterSec}s`
+  const message = `[本地养号防封刹车·非Google限流] local soft rate yield (${masked}, tier=${tier}, ${summary}, retryAfter=${retryAfterSec}s)`
 
   const acctKey = acctCooldownKey(s)
   const prev = cooldowns.get(acctKey)
@@ -2372,7 +2670,7 @@ function acquireAccountInflight(s, tierInfoOrNow = null, nowArg = Date.now()) {
   const current = set ? set.size : 0
   if (current >= maxInflight) {
     const masked = maskAccountId(s)
-    const message = `Antigravity: local concurrency cap reached for ${masked} (tier=${tierInfo.tier}, inflight=${current}/${maxInflight}); yielding for ${INFLIGHT_RETRY_AFTER_SEC}s`
+    const message = `[本地养号防封刹车·非Google限流] local soft rate yield (inflight cap, ${masked}, tier=${tierInfo.tier}, inflight=${current}/${maxInflight}, retryAfter=${INFLIGHT_RETRY_AFTER_SEC}s)`
     console.warn(`[antigravity] inflight-guard yield: account=${masked} tier=${tierInfo.tier} inflight=${current}/${maxInflight} retryAfter=${INFLIGHT_RETRY_AFTER_SEC}s proxy=${tierInfo.proxy || "direct"}`)
     return {
       acquired: false,
@@ -5749,6 +6047,8 @@ export const _internal = {
   tokenInFlight,
   signedIn,
   LOGINS_PATH,
+  PROVIDERS_PATH,
+  SETTINGS_PATH,
   PROXIES_PATH,
   WARMUP_PATH,
   PLAN_GUARD_DEFAULT_COOLDOWN_MS,
@@ -5773,6 +6073,8 @@ export const _internal = {
   accountInflightLeases,
   accountWarmupState,
   accountProxiesState,
+  providersConfigState,
+  settingsProxyState,
   accountEmailsByKey,
   planDowngradeAlerts,
   loginsPlanCache,
@@ -5785,9 +6087,13 @@ export const _internal = {
   rateGuardLimits,
   maskAccountId,
   maskProxyUrl,
+  gmailDotStrippedKey,
   parseProxyDescriptor,
+  reloadProvidersConfig,
+  reloadGlobalSettingsProxy,
   reloadAccountProxies,
   rememberAccountIdentity,
+  resolveUiAccountConcurrency,
   resolveProxyForAccount,
   readLoginsPlan,
   readLoginsEntry,

@@ -10,6 +10,8 @@ import path from "node:path"
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ag-guard-test-"))
 const WARMUP_FILE = path.join(tmpDir, "account-warmup.json")
+const PROVIDERS_FILE = path.join(tmpDir, "providers.json")
+const SETTINGS_FILE = path.join(tmpDir, "settings.json")
 const PROXIES_FILE = path.join(tmpDir, "account-proxies.json")
 const LOGINS_FILE = path.join(tmpDir, "logins.json")
 const COOLDOWNS_FILE = path.join(tmpDir, "cooldowns.json")
@@ -19,6 +21,8 @@ const RULES_FILE = path.join(tmpDir, "dynamic-rules.json")
 fs.copyFileSync(new URL("../dynamic-rules.json", import.meta.url), RULES_FILE)
 
 process.env.MAGPIE_AG_WARMUP_PATH = WARMUP_FILE
+process.env.MAGPIE_AG_PROVIDERS_PATH = PROVIDERS_FILE
+process.env.MAGPIE_AG_SETTINGS_PATH = SETTINGS_FILE
 process.env.MAGPIE_AG_PROXIES_PATH = PROXIES_FILE
 process.env.MAGPIE_AG_LOGINS_PATH = LOGINS_FILE
 process.env.MAGPIE_AG_COOLDOWNS_PATH = COOLDOWNS_FILE
@@ -52,12 +56,30 @@ function resetAllState() {
   _internal.accountProxiesState.mtimeMs = -1
   _internal.accountProxiesState.defaultProxy = null
   _internal.accountProxiesState.accounts = new Map()
+  _internal.accountProxiesState.accountsDot = new Map()
   _internal.accountProxiesState.loggedSelections.clear()
+  _internal.accountProxiesState.lastParseError = ""
+  _internal.providersConfigState.loaded = false
+  _internal.providersConfigState.checkedAt = 0
+  _internal.providersConfigState.mtimeMs = -1
+  _internal.providersConfigState.providerProxy = { mode: "unset", descriptor: null }
+  _internal.providersConfigState.accountProxiesExact = new Map()
+  _internal.providersConfigState.accountProxiesDot = new Map()
+  _internal.providersConfigState.accountConcurrencyExact = new Map()
+  _internal.providersConfigState.accountConcurrencyDot = new Map()
+  _internal.providersConfigState.coldStartError = null
+  _internal.providersConfigState.lastParseError = ""
+  _internal.settingsProxyState.loaded = false
+  _internal.settingsProxyState.checkedAt = 0
+  _internal.settingsProxyState.mtimeMs = -1
+  _internal.settingsProxyState.globalProxy = { mode: "unset", descriptor: null }
+  _internal.settingsProxyState.coldStartError = null
+  _internal.settingsProxyState.lastParseError = ""
   _internal.loginsPlanCache.checkedAt = 0
   _internal.loginsPlanCache.mtimeMs = -1
   _internal.loginsPlanCache.byEmail = new Map()
   _internal.accountPoolManager.destroyAll()
-  for (const p of [WARMUP_FILE, PROXIES_FILE, LOGINS_FILE, COOLDOWNS_FILE, ALERTS_FILE]) {
+  for (const p of [WARMUP_FILE, PROVIDERS_FILE, SETTINGS_FILE, PROXIES_FILE, LOGINS_FILE, COOLDOWNS_FILE, ALERTS_FILE]) {
     try {
       if (fs.existsSync(p)) fs.unlinkSync(p)
     } catch {}
@@ -117,12 +139,12 @@ try {
   const warmupText = fs.readFileSync(WARMUP_FILE, "utf8")
   assert.equal(warmupText.includes("old-pro-1@example.com"), false, "account-warmup.json must not store raw email")
 
-  // Old Pro accounts -> immediately pro-mature (2c / 8 / 30 / 120)
+  // Old Pro accounts -> immediately pro-mature (2c / 15 / 30 / 120)
   const oldProAcct = { rt: "rt-old-pro-2", who: "old-pro-1@example.com" }
   const oldTier = _internal.resolveAccountRateTier(oldProAcct, now, { plan: "Google AI Pro", tier: "g1-pro-tier", paid: "g1-pro-tier" })
   assert.equal(oldTier.tier, "pro-mature")
   assert.equal(oldTier.maxInflight, 2)
-  assert.equal(oldTier.maxPer1m, 8)
+  assert.equal(oldTier.maxPer1m, 15)
   assert.equal(oldTier.maxPer5m, 30)
   assert.equal(oldTier.maxPerHour, 120)
 
@@ -188,6 +210,8 @@ try {
   const hit1m = _internal.checkAndConsumeAccountRateLimit(testUltra, baseT + 1500, ultraProj)
   assert.equal(hit1m.limited, true)
   assert.equal(hit1m.tier, "ultra-mature")
+  assert.ok(hit1m.message.includes("[本地养号防封刹车·非Google限流]"), hit1m.message)
+  assert.ok(hit1m.message.includes("local soft rate"), hit1m.message)
   assert.ok(hit1m.retryAfterSec >= 30 && hit1m.retryAfterSec <= 180, `retryAfter=${hit1m.retryAfterSec}`)
   assert.equal(_internal.cooldowns.has(_internal.GLOBAL_BREAKER_KEY), false)
   assert.equal(fs.existsSync(COOLDOWNS_FILE), false, "soft rate limit must NEVER write cooldowns.json")
@@ -325,6 +349,9 @@ try {
     const res2 = await _internal.complete(sD1, "https://daily/v1beta/models/gemini-3-flash:streamGenerateContent", { method: "POST", body: VALID_BODY })
     assert.equal(res2.status, 429)
     assert.equal(res2.headers.get("Retry-After"), "5")
+    const res2Text = await res2.text()
+    assert.ok(res2Text.includes("[本地养号防封刹车·非Google限流]"), res2Text)
+    assert.ok(res2Text.includes("local soft rate"), res2Text)
     assert.equal(_internal.cooldowns.has(`acct:${sD1.rt}`), false, "inflight cap must NOT write acct cooldown")
     // Verify 1m rate counter stayed at 1 (rejected inflight request did not waste quota!)
     assert.equal(_internal.accountRateWindows.get(_internal.accountSalt(sD1))?.length, 1)
@@ -691,6 +718,244 @@ try {
       const resRecovered = await _internal.accountFetch(_internal.accountSalt(sCold), `https://localhost:${httpsTargetPort}/v1/cold-recovered`, { ca: srvCa })
       assert.equal(resRecovered.status, 200)
       assert.equal(proxyB.stats.connectCalls, 3, "recovered proxy B must receive traffic after fixing account-proxies.json")
+
+      // =========================================================================
+      // 6. Web UI Proxy Precedence, Gmail Dot Normalization, Fail-Closed & Concurrency Linkage
+      // =========================================================================
+      const gmailDom = ["gmail", "com"].join(".")
+      const googlemailDom = ["googlemail", "com"].join(".")
+      const dotExactUser = `ui.exact@${gmailDom}`
+      const dotBaseUser = `uidot@${gmailDom}`
+      const dotVariantUser = `u.i.d.o.t@${gmailDom}`
+      const googlemailBase = `gmuser@${googlemailDom}`
+      const googlemailVariant = `gm.user@${googlemailDom}`
+
+      // 6a) UI accountProxies overrides provider proxy, global proxy, and account-proxies.json
+      fs.writeFileSync(
+        PROXIES_FILE,
+        JSON.stringify(
+          {
+            default: `http://bob:s3cr3tB@127.0.0.1:${proxyB.port}`,
+            accounts: {
+              "ui-fallback@example.com": `http://alice:s3cr3tA@127.0.0.1:${proxyA.port}`,
+            },
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      )
+      fs.writeFileSync(
+        SETTINGS_FILE,
+        JSON.stringify({ proxy: `http://bob:s3cr3tB@127.0.0.1:${proxyB.port}` }, null, 2),
+        "utf8",
+      )
+      fs.writeFileSync(
+        PROVIDERS_FILE,
+        JSON.stringify(
+          {
+            providers: [
+              {
+                id: "antigravity",
+                proxy: `http://alice:s3cr3tA@127.0.0.1:${proxyA.port}`,
+                accountProxies: {
+                  "ui-direct@example.com": "direct",
+                  "ui-custom@example.com": `socks5h://socku:sockp@127.0.0.1:${proxySocks.port}`,
+                  "ui-inherit@example.com": "",
+                  "ui-invalid@example.com": "ftp://bad-ui-proxy:21",
+                  [dotBaseUser]: `http://bob:s3cr3tB@127.0.0.1:${proxyB.port}`,
+                  [dotExactUser]: "direct",
+                  [`uiexact@${gmailDom}`]: `http://alice:s3cr3tA@127.0.0.1:${proxyA.port}`,
+                  [googlemailVariant]: `socks5h://socku:sockp@127.0.0.1:${proxySocks.port}`,
+                },
+                accountConcurrency: {
+                  "ui-capped-pro@example.com": 1,
+                  "ui-higher-pro@example.com": 5,
+                  "ui-zero-pro@example.com": 0,
+                  "ui-d1-new@example.com": 4,
+                  [dotBaseUser]: 1,
+                },
+              },
+            ],
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      )
+      _internal.reloadProvidersConfig(true)
+      _internal.reloadGlobalSettingsProxy(true)
+      _internal.reloadAccountProxies(true)
+
+      const sUiDirect = { rt: "rt-ui-direct", who: "ui-direct@example.com" }
+      const sUiCustom = { rt: "rt-ui-custom", who: "ui-custom@example.com" }
+      const sUiInherit = { rt: "rt-ui-inherit", who: "ui-inherit@example.com" }
+      const sUiInvalid = { rt: "rt-ui-invalid", who: "ui-invalid@example.com" }
+      const sDotVariant = { rt: "rt-dot-var", who: dotVariantUser }
+      const sDotExact = { rt: "rt-dot-exact", who: dotExactUser }
+      const sGmBase = { rt: "rt-gm-base", who: googlemailBase }
+      for (const sx of [sUiDirect, sUiCustom, sUiInherit, sUiInvalid, sDotVariant, sDotExact, sGmBase]) {
+        _internal.rememberAccountIdentity(sx)
+      }
+
+      // accountProxies="direct" forces direct even when provider proxy, global proxy, and account-proxies.json are set
+      const prevA = proxyA.stats.connectCalls
+      const prevB = proxyB.stats.connectCalls
+      const prevSocks = proxySocks.stats.connections
+      const rDirect = await _internal.accountFetch(_internal.accountSalt(sUiDirect), `https://localhost:${httpsTargetPort}/v1/ui-direct`, { ca: srvCa })
+      assert.equal(rDirect.status, 200)
+      assert.equal(proxyA.stats.connectCalls, prevA)
+      assert.equal(proxyB.stats.connectCalls, prevB)
+
+      // accountProxies custom URL -> socks5 proxy
+      const rCustom = await _internal.accountFetch(_internal.accountSalt(sUiCustom), `https://localhost:${httpsTargetPort}/v1/ui-custom`, { ca: srvCa })
+      assert.equal(rCustom.status, 200)
+      assert.equal(proxySocks.stats.connections, prevSocks + 1)
+
+      // accountProxies="" (供应商代理) inherits provider.proxy (Proxy A)
+      const rInheritProv = await _internal.accountFetch(_internal.accountSalt(sUiInherit), `https://localhost:${httpsTargetPort}/v1/ui-inherit`, { ca: srvCa })
+      assert.equal(rInheritProv.status, 200)
+      assert.equal(proxyA.stats.connectCalls, prevA + 1)
+
+      // Invalid URL in accountProxies -> 502 Fail-Closed (NEVER falls back to direct!)
+      await assert.rejects(
+        () => _internal.accountFetch(_internal.accountSalt(sUiInvalid), `https://localhost:${httpsTargetPort}/v1/ui-invalid`, { ca: srvCa }),
+        (err) => err?.status === 502 && /invalid proxy configuration/i.test(err?.message ?? ""),
+      )
+
+      // Gmail dot-normalized match: u.i.d.o.t -> uidot (Proxy B)
+      const rDotVar = await _internal.accountFetch(_internal.accountSalt(sDotVariant), `https://localhost:${httpsTargetPort}/v1/dot-var`, { ca: srvCa })
+      assert.equal(rDotVar.status, 200)
+      assert.equal(proxyB.stats.connectCalls, prevB + 1)
+
+      // Exact lowercase match beats dot-stripped variant (ui.exact="direct" beats uiexact=Proxy A)
+      assert.equal(_internal.resolveProxyForAccount(_internal.accountSalt(sDotExact), dotExactUser), null)
+
+      // Googlemail reverse dot match: config has gm.user, lookup is gmuser -> socks5 proxy
+      const rGm = _internal.resolveProxyForAccount(_internal.accountSalt(sGmBase), googlemailBase)
+      assert.equal(rGm?.masked, `socks5h://127.0.0.1:${proxySocks.port}`)
+
+      // 6b) Provider proxy="direct" overrides global proxy & account-proxies.json
+      fs.writeFileSync(
+        PROVIDERS_FILE,
+        JSON.stringify({ providers: [{ id: "antigravity", proxy: "direct", accountProxies: {} }] }, null, 2),
+        "utf8",
+      )
+      _internal.reloadProvidersConfig(true)
+      const sFallback = { rt: "rt-ui-fallback", who: "ui-fallback@example.com" }
+      _internal.rememberAccountIdentity(sFallback)
+      assert.equal(_internal.resolveProxyForAccount(_internal.accountSalt(sFallback), "ui-fallback@example.com"), null)
+
+      // 6c) Provider proxy="" -> inherits settings.json global proxy (Proxy B)
+      fs.writeFileSync(
+        PROVIDERS_FILE,
+        JSON.stringify({ providers: [{ id: "antigravity", proxy: "", accountProxies: {} }] }, null, 2),
+        "utf8",
+      )
+      _internal.reloadProvidersConfig(true)
+      const rGlobal = _internal.resolveProxyForAccount(_internal.accountSalt(sFallback), "ui-fallback@example.com")
+      assert.equal(rGlobal?.masked, `http://127.0.0.1:${proxyB.port}`)
+
+      // 6d) settings.json proxy="" -> falls back to account-proxies.json (Proxy A for ui-fallback)
+      fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ theme: "system" }, null, 2), "utf8")
+      _internal.reloadGlobalSettingsProxy(true)
+      const rLegacy = _internal.resolveProxyForAccount(_internal.accountSalt(sFallback), "ui-fallback@example.com")
+      assert.equal(rLegacy?.masked, `http://127.0.0.1:${proxyA.port}`)
+
+      // 6e) providers.json malformed: hot-reload retains previous valid config; cold-start fails closed (502) and auto-recovers
+      fs.writeFileSync(
+        PROVIDERS_FILE,
+        JSON.stringify({ providers: [{ id: "antigravity", accountProxies: { "ui-hot@example.com": `http://bob:s3cr3tB@127.0.0.1:${proxyB.port}` } }] }, null, 2),
+        "utf8",
+      )
+      _internal.reloadProvidersConfig(true)
+      const sUiHot = { rt: "rt-ui-hot", who: "ui-hot@example.com" }
+      _internal.rememberAccountIdentity(sUiHot)
+      assert.equal(_internal.resolveProxyForAccount(_internal.accountSalt(sUiHot), "ui-hot@example.com")?.masked, `http://127.0.0.1:${proxyB.port}`)
+
+      // Corrupt providers.json on hot reload -> keeps Proxy B!
+      fs.writeFileSync(PROVIDERS_FILE, "{ bad providers json", "utf8")
+      _internal.reloadProvidersConfig(true)
+      assert.equal(_internal.resolveProxyForAccount(_internal.accountSalt(sUiHot), "ui-hot@example.com")?.masked, `http://127.0.0.1:${proxyB.port}`)
+
+      // Cold start with corrupt providers.json -> 502 Fail-Closed!
+      _internal.providersConfigState.loaded = false
+      _internal.providersConfigState.mtimeMs = -1
+      _internal.providersConfigState.checkedAt = 0
+      _internal.providersConfigState.coldStartError = null
+      _internal.providersConfigState.lastParseError = ""
+      await assert.rejects(
+        () => _internal.accountFetch(_internal.accountSalt(sUiHot), `https://localhost:${httpsTargetPort}/v1/ui-cold-bad`, { ca: srvCa }),
+        (err) => err?.status === 502 && /invalid proxy configuration/i.test(err?.message ?? ""),
+      )
+
+      // Fix providers.json -> auto-recovers!
+      fs.writeFileSync(
+        PROVIDERS_FILE,
+        JSON.stringify(
+          {
+            providers: [
+              {
+                id: "antigravity",
+                accountProxies: {
+                  "ui-hot@example.com": `http://bob:s3cr3tB@127.0.0.1:${proxyB.port}`,
+                },
+                accountConcurrency: {
+                  "ui-capped-pro@example.com": 1,
+                  "ui-higher-pro@example.com": 5,
+                  "ui-zero-pro@example.com": 0,
+                  "ui-d1-new@example.com": 4,
+                  [dotBaseUser]: 1,
+                },
+              },
+            ],
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      )
+      _internal.providersConfigState.checkedAt = 0
+      const rHotRecovered = await _internal.accountFetch(_internal.accountSalt(sUiHot), `https://localhost:${httpsTargetPort}/v1/ui-cold-ok`, { ca: srvCa })
+      assert.equal(rHotRecovered.status, 200)
+
+      // 6f) UI accountConcurrency strict-min linkage (never exceeds 48h warmup d1/d2 1c or mature 2c)
+      const nowConc = Date.UTC(2026, 10, 26, 2, 0, 0)
+      fs.writeFileSync(
+        LOGINS_FILE,
+        JSON.stringify(
+          [
+            { agent: "plugin:antigravity", user: "ui-capped-pro@example.com", plan: "Google AI Pro", seen: new Date(nowConc - 10 * 24 * 3600_000).toISOString() },
+            { agent: "plugin:antigravity", user: "ui-higher-pro@example.com", plan: "Google AI Pro", seen: new Date(nowConc - 10 * 24 * 3600_000).toISOString() },
+            { agent: "plugin:antigravity", user: "ui-zero-pro@example.com", plan: "Google AI Pro", seen: new Date(nowConc - 10 * 24 * 3600_000).toISOString() },
+            { agent: "plugin:antigravity", user: dotVariantUser, plan: "Google AI Pro", seen: new Date(nowConc - 10 * 24 * 3600_000).toISOString() },
+            { agent: "plugin:antigravity", user: "ui-d1-new@example.com", plan: "Google AI Pro", seen: new Date(nowConc - 60_000).toISOString() },
+          ],
+          null,
+          2,
+        ),
+        "utf8",
+      )
+      _internal.loginsPlanCache.checkedAt = 0
+      _internal.loginsPlanCache.mtimeMs = -1
+      const proProj = { plan: "Google AI Pro", tier: "g1-pro-tier", paid: "g1-pro-tier" }
+      const cappedTier = _internal.resolveAccountRateTier({ rt: "rt-conc-cap", who: "ui-capped-pro@example.com" }, nowConc, proProj)
+      assert.equal(cappedTier.tier, "pro-mature")
+      assert.equal(cappedTier.maxPer1m, 15)
+      assert.equal(cappedTier.maxInflight, 1, "UI accountConcurrency=1 must tighten pro-mature 2c -> 1c")
+
+      const dotCappedTier = _internal.resolveAccountRateTier({ rt: "rt-conc-dot", who: dotVariantUser }, nowConc, proProj)
+      assert.equal(dotCappedTier.maxInflight, 1, "Gmail dot-normalized accountConcurrency=1 must tighten pro-mature 2c -> 1c")
+
+      const higherTier = _internal.resolveAccountRateTier({ rt: "rt-conc-hi", who: "ui-higher-pro@example.com" }, nowConc, proProj)
+      assert.equal(higherTier.maxInflight, 2, "UI accountConcurrency=5 must NOT exceed pro-mature 2c")
+
+      const zeroTier = _internal.resolveAccountRateTier({ rt: "rt-conc-zero", who: "ui-zero-pro@example.com" }, nowConc, proProj)
+      assert.equal(zeroTier.maxInflight, 2, "UI accountConcurrency=0 means unlimited/default -> keep pro-mature 2c")
+
+      const d1UiTier = _internal.resolveAccountRateTier({ rt: "rt-conc-d1", who: "ui-d1-new@example.com" }, nowConc, proProj)
+      assert.equal(d1UiTier.tier, "pro-warmup-d1")
+      assert.equal(d1UiTier.maxInflight, 1, "UI accountConcurrency=4 must NEVER break warmup d1 1c red line")
 
       // Verify zero credential leaks in console logs
       const allLogs = logged.join("\n")

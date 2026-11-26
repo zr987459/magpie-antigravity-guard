@@ -31,10 +31,12 @@
      - 持久化在 `account-warmup.json`（脱敏 hash、`0600` 权限）；基于 `logins.json` `seen` 时间自动豁免运行超过 48 小时的成熟老号，而新登录账号或从 `free/starter` 刚升级为 `pro/ultra` 的账号自动进入 48 小时爬坡保护：
        - `d1`（0–24h）：`1c / 4/1m / 12/5m / 45/1h`，软冷却 `45s–180s`
        - `d2`（24–48h）：`1c / 6/1m / 22/5m / 90/1h`，软冷却 `30s–150s`
-       - `pro-mature`（>48h）：`2c / 8/1m / 30/5m / 120/1h`，软冷却 `15s–300s`
+       - `pro-mature`（>48h）：`2c / 15/1m / 30/5m / 120/1h`，软冷却 `15s–300s`
        - `ultra-mature`（>48h）：`2c / 10/1m / 40/5m / 180/1h`，软冷却 `30s–180s`
-6. **单号独立代理物理隔离（Per-Account Proxy Isolation）**
-   - 读取插件目录下 `account-proxies.json`（按 mtime 每 10 秒热加载，支持 `http://`、`https://`、`socks5://`、`socks5h://` 及账密认证），将 OAuth 刷新（`oauth2.googleapis.com`）与 Code Assist（`cloudcode-pa.googleapis.com` / `daily-cloudcode-pa.googleapis.com`）全链路绑定至该账号专属代理连接池，严禁回落直连；切换代理 URL 时自动销毁旧连接池并重建，日志严格脱敏（仅输出 `proxy=http://host:port` 或 `proxy=direct`）。
+     - 联动 Magpie 网页 UI 单号并发上限（`providers.json` 中 `accountConcurrency`）：若为正整数且严格小于当前档位 `maxInflight`，取 `Math.min(tierMaxInflight, uiConcurrency)`，绝不突破 48h 养号期 `1c` 红线。
+6. **网页 UI 优先 · 单号独立代理物理隔离（Per-Account Proxy Isolation）**
+   - 原生打通 Magpie 网页 UI 代理配置（`providers.json` 的 `accountProxies[email]` / `proxy` 与 `settings.json` 全局代理，10 秒 `mtime` 热加载），支持 Gmail / Googlemail 去点号归一化兜底匹配与 `"direct"` 强制直连；未配置时再兼容回落至插件目录下 `account-proxies.json`。
+   - 支持 `http://`、`https://`、`socks5://`、`socks5h://` 及账密认证，将 OAuth 刷新（`oauth2.googleapis.com`）与 Code Assist（`cloudcode-pa.googleapis.com` / `daily-cloudcode-pa.googleapis.com`）全链路绑定至该账号专属代理连接池，非法 URL 或冷启动配置损坏一律 `502` Fail-Closed 严禁回落直连；切换代理 URL 时自动销毁旧连接池并重建，日志严格脱敏（仅输出 `proxy=http://host:port` 或 `proxy=direct`）。
 7. **开箱即用 · 云端词库自动热同步**
    - 无需安装额外外部脚本或 systemd 定时任务！
    - 插件启动后每 **30 分钟** 在后台非阻塞异步检查一次最新词库（5 秒超时，静默容错绝不影响正常对话），遇到疑似新风控 429 时也会立即后台拉取更新并热生效。
@@ -95,7 +97,7 @@ magpie plugin update
 | `AG_RATE_GUARD_ENABLED` | `true` | 是否开启单号 4 维并发与滑窗软限流 |
 | `AG_WARMUP_HOURS` | `48` | 新号/新升级账号阶梯养号保护时长（小时） |
 | `AG_MAX_INFLIGHT` | `2` | 成熟 Pro 账号单号最大并发数 |
-| `AG_MAX_REQ_PER_1M` | `8` | 成熟 Pro 账号 1 分钟脉冲上限 |
+| `AG_MAX_REQ_PER_1M` | `15` | 成熟 Pro 账号 1 分钟脉冲上限 |
 | `AG_MAX_REQ_PER_5M` | `30` | 成熟 Pro 账号 5 分钟推理请求软上限 |
 | `AG_MAX_REQ_PER_HOUR` | `120` | 成熟 Pro 账号 60 分钟推理请求软上限 |
 | `AG_RATE_COOLDOWN_MIN_MS` | `15000` | Pro 软限流最小冷却（毫秒） |
@@ -106,14 +108,16 @@ magpie plugin update
 | `AG_ULTRA_MAX_REQ_PER_HOUR` | `180` | 成熟 Ultra 账号 60 分钟推理请求软上限 |
 | `AG_ULTRA_RATE_COOLDOWN_MIN_MS` | `30000` | Ultra 账号软限流最小冷却（毫秒） |
 | `AG_ULTRA_RATE_COOLDOWN_MAX_MS` | `180000` | Ultra 账号软限流最大冷却（毫秒） |
-| `MAGPIE_AG_PROXIES_PATH` | `<plugin>/account-proxies.json` | 单号独立代理配置文件路径（10s 热加载） |
+| `MAGPIE_AG_PROVIDERS_PATH` | `<config>/providers.json` | Magpie 网页 UI 供应商配置路径（单号代理/并发 10s 热加载） |
+| `MAGPIE_AG_SETTINGS_PATH` | `<config>/settings.json` | Magpie 全局设置文件路径（全局代理 10s 热加载） |
+| `MAGPIE_AG_PROXIES_PATH` | `<plugin>/account-proxies.json` | 兼容兜底单号代理配置文件路径（10s 热加载） |
 | `MAGPIE_AG_WARMUP_PATH` | `<plugin>/account-warmup.json` | 养号状态持久化文件路径 |
 
 *(也支持在 `dynamic-rules.json` 的 `planGuard` 对象中热配置 `{ "enabled": true, "allowFreeEmails": [], "cooldownMs": 0 }`。)*
 
-### 单号独立代理绑定（`account-proxies.json`）
+### 单号独立代理绑定（网页 UI 优先，兼容 `account-proxies.json`）
 
-在插件目录下编辑 `account-proxies.json`（权限 `0600`，10 秒内自动热生效，无需重启）：
+推荐直接在 Magpie 网页 UI 中为 `antigravity` 各账号设置「直连」/「自定义」/「供应商代理」（写入 `providers.json` 的 `accountProxies` 与 `proxy`），插件每 10 秒自动热加载生效；如需本地文件兜底，也可在插件目录下编辑 `account-proxies.json`（权限 `0600`，10 秒内自动热生效，无需重启）：
 
 ```json
 {
